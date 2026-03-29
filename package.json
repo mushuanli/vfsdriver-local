@@ -1,0 +1,47 @@
+{
+    "name": "@itookit/vfsdriver-localfs",
+    "version": "0.1.0",
+    "description": "Transparent local-filesystem VFS backend — reads and writes go directly to real files on disk.",
+    "type": "module",
+    "main": "./src/index.ts",
+    "module": "./src/index.ts",
+    "types": "./src/index.ts",
+    "exports": {
+        ".": {
+            "types": "./src/index.ts",
+            "import": "./src/index.ts",
+            "default": "./src/index.ts"
+        }
+    },
+    "publishConfig": {
+        "access": "public",
+        "main": "./dist/index.js",
+        "module": "./dist/index.mjs",
+        "types": "./dist/index.d.ts",
+        "exports": {
+            ".": {
+                "types": "./dist/index.d.ts",
+                "import": "./dist/index.mjs",
+                "require": "./dist/index.js"
+            }
+        }
+    },
+    "files": ["dist"],
+    "scripts": {
+        "build": "tsup",
+        "dev": "tsup --watch",
+        "prepublishOnly": "pnpm build"
+    },
+    "keywords": ["itookit", "vfs", "localfs", "filesystem", "native", "storage", "node"],
+    "author": "lizlok@gmail.com",
+    "license": "MIT",
+    "dependencies": {
+        "@itookit/common": "workspace:*",
+        "better-sqlite3": "^11.0.0"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "^7.6.0",
+        "tsup": "^8.5.1",
+        "typescript": "^5.9.3"
+    }
+}

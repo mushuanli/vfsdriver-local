@@ -29,7 +29,10 @@ export class LocalFSMetaStore implements IMetaStore {
 
         return {
             ino,
-            contentRef:      String(ino),
+            // Directories have no content; only files carry a contentRef.
+            // Leaving contentRef set for directories would cause deleteWalk to
+            // call content.deleteData → fsOps.unlink(directoryPath) → EPERM.
+            contentRef:      stat.isDirectory ? undefined : String(ino),
             modifiedAt:      stat.mtimeMs,
             size:            stat.isDirectory ? 0 : stat.size,
             version:         Math.floor(stat.mtimeMs),

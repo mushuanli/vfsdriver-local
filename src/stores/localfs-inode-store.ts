@@ -29,9 +29,32 @@ export class LocalFSInodeStore implements IInodeStore {
     async getInode(ino: number): Promise<InodeRecord | null> {
         const entry = await this.db.getEntry(ino);
         if (!entry) return null;
-        const stat = await this.fsOps.stat(this.toRealPath(entry.rel));
-        if (!stat) return null;
+        // VFS-internal paths (asset dirs: _name, internal dirs: __name) are stored
+        // only in the sidecar DB — they have no physical counterpart on disk.
+        // Skip the filesystem stat for these; trust the DB record.
+        const isVfsInternal = entry.rel.split('/').some(seg => seg.startsWith('_'));
+        if (!isVfsInternal) {
+            const stat = await this.fsOps.stat(this.toRealPath(entry.rel));
+            if (!stat) return null;
+        }
         return this.buildRecord(ino, entry.rel, entry.type as 'file' | 'directory');
+    }
+
+    // ── Patcher helper ──────────────────────────────────────────────────────────
+
+    /**
+     * Ensures the inode record for a directory at `rel` has a proper entry in
+     * the sidecar DB so that `getInoForRel(rel)` returns a non-null value.
+     * Called by buildRecord when a parent directory is not yet registered.
+     */
+    private async ensureParentIno(parentRel: string): Promise<number> {
+        const existing = await this.db.getInoForRel(parentRel);
+        if (existing !== null) return existing;
+        // Parent directory exists on disk but was never explicitly registered.
+        // Register it now so subsequent buildRecord calls resolve correctly.
+        const stat = await this.fsOps.stat(this.toRealPath(parentRel));
+        const createdAt = stat?.birthtimeMs ?? Date.now();
+        return this.db.registerPath(parentRel, 'directory', createdAt);
     }
 
     async lookup(parentIno: number, name: string): Promise<InodeRecord | null> {
@@ -39,7 +62,18 @@ export class LocalFSInodeStore implements IInodeStore {
         if (parentRel === null) return null;
 
         const childRel = parentRel === '' ? name : `${parentRel}/${name}`;
-        const stat     = await this.fsOps.stat(this.toRealPath(childRel));
+
+        // VFS-internal names (_name, __name) live only in the sidecar DB.
+        // Check the DB directly instead of stat-ing the filesystem.
+        if (name.startsWith('_')) {
+            const ino = await this.db.getInoForRel(childRel);
+            if (ino === null) return null;
+            const dbEntry = await this.db.getEntry(ino);
+            if (!dbEntry) return null;
+            return { ino, parentIno, name, type: dbEntry.type as 'file' | 'directory', createdAt: 0, nlink: 1 };
+        }
+
+        const stat = await this.fsOps.stat(this.toRealPath(childRel));
         if (!stat) return null;
 
         const type: 'file' | 'directory' = stat.isDirectory ? 'directory' : 'file';
@@ -95,7 +129,13 @@ export class LocalFSInodeStore implements IInodeStore {
         const sidecarType: 'file' | 'directory' = inode.type === 'directory' ? 'directory' : 'file';
 
         if (inode.type === 'directory') {
-            await this.fsOps.mkdir(realPath);
+            // Asset dirs (_filename/) and internal dirs (__config/) are VFS-internal
+            // metadata. For LocalFS the rootDir is the user's real filesystem, so we
+            // must NOT create these on disk — register only in the sidecar DB.
+            const isVfsInternal = inode.name.startsWith('_');
+            if (!isVfsInternal) {
+                await this.fsOps.mkdir(realPath);
+            }
         } else {
             const stagePath = await this.db.getStagePath(String(inode.ino));
             await this.fsOps.mkdir(dirnamePath(realPath));
@@ -161,8 +201,17 @@ export class LocalFSInodeStore implements IInodeStore {
         return rel === '' ? this.rootDir : joinPath(this.rootDir, rel);
     }
 
-    private buildRecord(ino: number, rel: string, type: 'file' | 'directory'): InodeRecord {
+    private async buildRecord(ino: number, rel: string, type: 'file' | 'directory'): Promise<InodeRecord> {
         const name = rel === '' ? '' : basenamePath(rel);
-        return { ino, parentIno: ROOT_INO, name, type, createdAt: 0, nlink: 1 };
+        // Compute the true parentIno from the rel path instead of hardcoding ROOT_INO.
+        // Without this, _buildAbsPath in ModuleFS walks up only one level (the file
+        // itself) and produces wrong paths like '/guide.md' instead of '/docs/guide.md'.
+        const slashIdx = rel.lastIndexOf('/');
+        let parentIno = ROOT_INO;
+        if (slashIdx > 0) {
+            const parentRel = rel.slice(0, slashIdx);
+            parentIno = await this.ensureParentIno(parentRel);
+        }
+        return { ino, parentIno, name, type, createdAt: 0, nlink: 1 };
     }
 }

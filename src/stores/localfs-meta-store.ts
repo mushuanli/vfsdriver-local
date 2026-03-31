@@ -3,7 +3,7 @@
  * IMetaStore backed by IFsOps.stat() + ISidecarDb. No direct node:fs import.
  */
 
-import type { IMetaStore, MetaRecord } from '@itookit/common';
+import type { IMetaStore, MetaRecord, MetaWalkOptions } from '@itookit/common';
 import type { ISidecarDb, MetaExtRow } from '../db/sidecar-interface';
 import type { IFsOps } from '../fs/fs-ops';
 import { joinPath } from '../utils/fs-utils';
@@ -84,18 +84,51 @@ export class LocalFSMetaStore implements IMetaStore {
         if (partial.tags !== undefined) await this.db.syncTags(ino, partial.tags);
     }
 
-    async batchGetMeta(inos: number[]): Promise<MetaRecord[]> {
-        const results: MetaRecord[] = [];
-        for (const ino of inos) {
-            const r = await this.getMeta(ino);
-            if (r) results.push(r);
+    async forEachMeta(
+        inos: number[],
+        callback: (meta: MetaRecord, index: number) => boolean | Promise<boolean>,
+    ): Promise<void> {
+        for (let i = 0; i < inos.length; i++) {
+            const rec = await this.getMeta(inos[i]);
+            if (rec) {
+                if (!(await callback(rec, i))) break;
+            }
         }
-        return results;
     }
 
-    async queryByTag(tag: string): Promise<number[]>                      { return this.db.queryByTag(tag); }
-    async queryByMetadata(field: string, value: unknown): Promise<number[]> {
-        return this.db.queryByMetadata(`$.${field}`, typeof value === 'string' ? value : JSON.stringify(value));
+    async walkByTag(
+        tag: string,
+        callback: (ino: number) => boolean | Promise<boolean>,
+        options?: MetaWalkOptions,
+    ): Promise<{ total: number; processed: number }> {
+        const inos = await this.db.queryByTag(tag);
+        const total = inos.length;
+        let processed = 0;
+        const offset = options?.offset ?? 0;
+        const limit = options?.limit ?? Infinity;
+        for (let i = offset; i < inos.length && processed < limit; i++) {
+            if (!(await callback(inos[i]))) break;
+            processed++;
+        }
+        return { total, processed };
+    }
+
+    async walkByMetadata(
+        field: string,
+        value: unknown,
+        callback: (ino: number) => boolean | Promise<boolean>,
+        options?: MetaWalkOptions,
+    ): Promise<{ total: number; processed: number }> {
+        const inos = await this.db.queryByMetadata(`$.${field}`, typeof value === 'string' ? value : JSON.stringify(value));
+        const total = inos.length;
+        let processed = 0;
+        const offset = options?.offset ?? 0;
+        const limit = options?.limit ?? Infinity;
+        for (let i = offset; i < inos.length && processed < limit; i++) {
+            if (!(await callback(inos[i]))) break;
+            processed++;
+        }
+        return { total, processed };
     }
 
     private toExtRow(meta: MetaRecord): MetaExtRow {

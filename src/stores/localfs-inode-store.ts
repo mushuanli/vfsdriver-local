@@ -4,7 +4,7 @@
  * No direct node:fs import — all FS operations go through IFsOps.
  */
 
-import type { IInodeStore, InodeRecord } from '@itookit/common';
+import type { IInodeStore, InodeRecord, InodeWalkOptions } from '@itookit/common';
 import type { ISidecarDb } from '../db/sidecar-interface';
 import type { IFsOps } from '../fs/fs-ops';
 import { joinPath, basenamePath, dirnamePath } from '../utils/fs-utils';
@@ -82,7 +82,7 @@ export class LocalFSInodeStore implements IInodeStore {
         return { ino, parentIno, name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 };
     }
 
-    async listChildren(parentIno: number): Promise<InodeRecord[]> {
+    private async _listChildrenInternal(parentIno: number): Promise<InodeRecord[]> {
         const parentRel = await this.db.getRelPath(parentIno);
         if (parentRel === null) return [];
 
@@ -103,13 +103,16 @@ export class LocalFSInodeStore implements IInodeStore {
         return results;
     }
 
-    async batchGetInodes(inos: number[]): Promise<InodeRecord[]> {
-        const results: InodeRecord[] = [];
-        for (const ino of inos) {
-            const r = await this.getInode(ino);
-            if (r) results.push(r);
+    async forEachInode(
+        inos: number[],
+        callback: (inode: InodeRecord, index: number) => boolean | Promise<boolean>,
+    ): Promise<void> {
+        for (let i = 0; i < inos.length; i++) {
+            const rec = await this.getInode(inos[i]);
+            if (rec) {
+                if (!(await callback(rec, i))) break;
+            }
         }
-        return results;
     }
 
     // ── Write ──────────────────────────────────────────────────────────────────
@@ -193,6 +196,63 @@ export class LocalFSInodeStore implements IInodeStore {
             await this.fsOps.unlink(realPath);
         }
         await this.db.deletePath(ino);
+    }
+
+    async walkTree(
+        parentIno: number,
+        callback: (inode: InodeRecord, depth: number) => boolean | 'skip' | Promise<boolean | 'skip'>,
+        options?: InodeWalkOptions,
+    ): Promise<void> {
+        if (options?.order === 'breadth-first') {
+            await this._walkBFS(parentIno, callback, options?.maxDepth ?? -1);
+        } else {
+            await this._walkDFS(parentIno, callback, 0, options?.maxDepth ?? -1);
+        }
+    }
+
+    private async _walkDFS(
+        parentIno: number,
+        callback: (inode: InodeRecord, depth: number) => boolean | 'skip' | Promise<boolean | 'skip'>,
+        depth: number,
+        maxDepth: number,
+    ): Promise<boolean> {
+        const children = await this._listChildrenInternal(parentIno);
+        for (const child of children) {
+            const result = await callback(child, depth);
+            if (result === false) return false;
+            if (result !== 'skip' && child.type === 'directory' && (maxDepth < 0 || depth < maxDepth)) {
+                if (!(await this._walkDFS(child.ino, callback, depth + 1, maxDepth))) return false;
+            }
+        }
+        return true;
+    }
+
+    private async _walkBFS(
+        parentIno: number,
+        callback: (inode: InodeRecord, depth: number) => boolean | 'skip' | Promise<boolean | 'skip'>,
+        maxDepth: number,
+    ): Promise<void> {
+        const queue: Array<{ ino: number; depth: number }> = [{ ino: parentIno, depth: -1 }];
+        while (queue.length > 0) {
+            const { ino, depth } = queue.shift()!;
+            const nextDepth = depth + 1;
+            if (maxDepth >= 0 && nextDepth > maxDepth) continue;
+            const children = await this._listChildrenInternal(ino);
+            for (const child of children) {
+                const result = await callback(child, nextDepth);
+                if (result === false) return;
+                if (result !== 'skip' && child.type === 'directory') {
+                    queue.push({ ino: child.ino, depth: nextDepth });
+                }
+            }
+        }
+    }
+
+    async hasChildren(parentIno: number): Promise<boolean> {
+        const parentRel = await this.db.getRelPath(parentIno);
+        if (parentRel === null) return false;
+        const entries = await this.fsOps.readDir(this.toRealPath(parentRel));
+        return entries.length > 0;
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────

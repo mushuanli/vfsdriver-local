@@ -53,6 +53,13 @@ export interface ISidecarDb {
     /** Insert with a specific ino (INSERT OR IGNORE — idempotent). */
     insertPath(ino: number, rel: string, type: 'file' | 'directory', createdAt: number): Promise<void>;
 
+    /**
+     * List direct children of a directory by its relative path.
+     * Used to discover VFS-internal entries (asset dirs, __config/) that are
+     * registered in the sidecar but not created on the real filesystem.
+     */
+    listDirectChildren(parentRel: string): Promise<Array<{ ino: number; name: string; type: 'file' | 'directory'; createdAt: number }>>;
+
     updateRel(ino: number, newRel: string): Promise<void>;
     deletePath(ino: number): Promise<void>;
 
@@ -70,6 +77,8 @@ export interface ISidecarDb {
     /** Replace the tag index for an ino (delete-all + re-insert). */
     syncTags(ino: number, tags: string[] | undefined): Promise<void>;
     queryByTag(tag: string): Promise<number[]>;
+    /** Return all distinct tag strings currently in use. O(T). */
+    getAllDistinctTags(): Promise<string[]>;
     queryByMetadata(jsonPath: string, value: string): Promise<number[]>;
 
     // ── Transaction ───────────────────────────────────────────────────────────

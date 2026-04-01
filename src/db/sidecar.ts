@@ -32,12 +32,16 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     private readonly stmtClearStage:    Database.Statement;
     private readonly stmtAllStage:      Database.Statement;
 
+    private readonly stmtListChildrenRoot: Database.Statement;
+    private readonly stmtListChildrenDir:  Database.Statement;
+
     private readonly stmtGetMetaExt:    Database.Statement;
     private readonly stmtUpsertMetaExt: Database.Statement;
     private readonly stmtDeleteMetaExt: Database.Statement;
     private readonly stmtDelTags:       Database.Statement;
     private readonly stmtInsTags:       Database.Statement;
     private readonly stmtQueryByTag:    Database.Statement;
+    private readonly stmtAllDistinctTags: Database.Statement;
 
     constructor(dbPath: string) {
         this.db = new Database(dbPath);
@@ -61,6 +65,16 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         this.stmtSetStage    = this.db.prepare('INSERT OR REPLACE INTO staging (ref, path) VALUES (?, ?)');
         this.stmtClearStage  = this.db.prepare('DELETE FROM staging WHERE ref = ?');
         this.stmtAllStage    = this.db.prepare('SELECT ref, path FROM staging');
+
+        // Direct children queries — used to find VFS-internal dirs not present on real FS.
+        // Root children: non-empty rel with no slash.
+        // Subdir children: rel matches 'parent/*' but not 'parent/*/*'.
+        this.stmtListChildrenRoot = this.db.prepare(
+            `SELECT ino, rel, type, created_at FROM path_ino WHERE rel != '' AND rel NOT GLOB '*/*'`,
+        );
+        this.stmtListChildrenDir = this.db.prepare(
+            `SELECT ino, rel, type, created_at FROM path_ino WHERE rel GLOB ? AND rel NOT GLOB ?`,
+        );
 
         this.stmtGetMetaExt    = this.db.prepare('SELECT * FROM meta_ext WHERE ino = ?');
         this.stmtUpsertMetaExt = this.db.prepare(`
@@ -86,6 +100,7 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         this.stmtDelTags       = this.db.prepare('DELETE FROM meta_tags WHERE ino = ?');
         this.stmtInsTags       = this.db.prepare('INSERT OR IGNORE INTO meta_tags (ino, tag) VALUES (?, ?)');
         this.stmtQueryByTag    = this.db.prepare('SELECT ino FROM meta_tags WHERE tag = ?');
+        this.stmtAllDistinctTags = this.db.prepare('SELECT DISTINCT tag FROM meta_tags');
     }
 
     // ── Ino counter ────────────────────────────────────────────────────────────
@@ -121,6 +136,20 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
 
     async insertPath(ino: number, rel: string, type: 'file' | 'directory', createdAt: number): Promise<void> {
         this.stmtInsertPath.run(ino, rel, type, createdAt);
+    }
+
+    async listDirectChildren(parentRel: string): Promise<Array<{ ino: number; name: string; type: 'file' | 'directory'; createdAt: number }>> {
+        type Row = { ino: number; rel: string; type: string; created_at: number };
+        const rows: Row[] = parentRel === ''
+            ? this.stmtListChildrenRoot.all() as Row[]
+            : this.stmtListChildrenDir.all(`${parentRel}/*`, `${parentRel}/*/*`) as Row[];
+        const prefixLen = parentRel === '' ? 0 : parentRel.length + 1;
+        return rows.map(r => ({
+            ino: r.ino,
+            name: r.rel.slice(prefixLen),
+            type: r.type as 'file' | 'directory',
+            createdAt: r.created_at,
+        }));
     }
 
     async updateRel(ino: number, newRel: string): Promise<void> {
@@ -173,6 +202,10 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
 
     async queryByTag(tag: string): Promise<number[]> {
         return (this.stmtQueryByTag.all(tag) as Array<{ ino: number }>).map(r => r.ino);
+    }
+
+    async getAllDistinctTags(): Promise<string[]> {
+        return (this.stmtAllDistinctTags.all() as Array<{ tag: string }>).map(r => r.tag);
     }
 
     async queryByMetadata(jsonPath: string, value: string): Promise<number[]> {

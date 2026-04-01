@@ -16,7 +16,7 @@ export class LocalFSInodeStore implements IInodeStore {
         private readonly rootDir: string,
         private readonly db: ISidecarDb,
         private readonly fsOps: IFsOps,
-    ) {}
+    ) { }
 
     // ── Allocation ─────────────────────────────────────────────────────────────
 
@@ -89,8 +89,11 @@ export class LocalFSInodeStore implements IInodeStore {
         const realDir = this.toRealPath(parentRel);
         const entries = await this.fsOps.readDir(realDir);
 
+        const realNames = new Set<string>();
         const results: InodeRecord[] = [];
+
         for (const entry of entries) {
+            realNames.add(entry.name);
             const childRel = parentRel === '' ? entry.name : `${parentRel}/${entry.name}`;
             const type: 'file' | 'directory' = entry.isDirectory ? 'directory' : 'file';
 
@@ -100,6 +103,16 @@ export class LocalFSInodeStore implements IInodeStore {
             const ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
             results.push({ ino, parentIno, name: entry.name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 });
         }
+
+        // VFS-internal dirs (asset dirs `_name/`, `__config/`) are not created on the
+        // real filesystem (see putInode). Merge them in from the sidecar DB.
+        const dbChildren = await this.db.listDirectChildren(parentRel);
+        for (const child of dbChildren) {
+            if (!realNames.has(child.name)) {
+                results.push({ ino: child.ino, parentIno, name: child.name, type: child.type, createdAt: child.createdAt, nlink: 1 });
+            }
+        }
+
         return results;
     }
 
@@ -127,8 +140,8 @@ export class LocalFSInodeStore implements IInodeStore {
         if (existingRel !== null) return; // already tracked (re-mount or upsert)
 
         const parentRel = (await this.db.getRelPath(inode.parentIno)) ?? '';
-        const rel       = parentRel === '' ? inode.name : `${parentRel}/${inode.name}`;
-        const realPath  = this.toRealPath(rel);
+        const rel = parentRel === '' ? inode.name : `${parentRel}/${inode.name}`;
+        const realPath = this.toRealPath(rel);
         const sidecarType: 'file' | 'directory' = inode.type === 'directory' ? 'directory' : 'file';
 
         if (inode.type === 'directory') {
@@ -169,13 +182,13 @@ export class LocalFSInodeStore implements IInodeStore {
 
         if (updates.parentIno !== undefined && updates.name !== undefined) {
             newParentRel = (await this.db.getRelPath(updates.parentIno)) ?? '';
-            newName      = updates.name;
+            newName = updates.name;
         } else if (updates.parentIno !== undefined) {
             newParentRel = (await this.db.getRelPath(updates.parentIno)) ?? '';
-            newName      = basenamePath(oldRel);
+            newName = basenamePath(oldRel);
         } else {
             newParentRel = dirnamePath(oldRel) === '/' ? '' : dirnamePath(oldRel);
-            newName      = updates.name!;
+            newName = updates.name!;
         }
 
         const newRel = newParentRel === '' ? newName : `${newParentRel}/${newName}`;
@@ -241,7 +254,7 @@ export class LocalFSInodeStore implements IInodeStore {
             for (const child of children) {
                 const result = await callback(child, nextDepth);
                 if (result === false) return;
-                if (result !== 'skip' && child.type === 'directory') {
+                if (result !== 'skip' && child.type === 'directory' && (maxDepth < 0 || nextDepth < maxDepth)) {
                     queue.push({ ino: child.ino, depth: nextDepth });
                 }
             }

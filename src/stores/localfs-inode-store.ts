@@ -1,7 +1,12 @@
 /**
  * @file vfsdriver-localfs/src/stores/localfs-inode-store.ts
+ *
  * IInodeStore backed by real filesystem via IFsOps + ISidecarDb.
- * No direct node:fs import — all FS operations go through IFsOps.
+ *
+ * lookup() only writes to the DB when a file exists on disk but has no
+ * DB entry yet (registerPath is idempotent). This is safe because:
+ * - LocalFSBackend.txQueue ensures no two operations run concurrently.
+ * - registerPath uses INSERT OR IGNORE, so duplicate calls are harmless.
  */
 
 import type { IInodeStore, InodeRecord, InodeWalkOptions } from '@itookit/common';
@@ -27,8 +32,11 @@ export class LocalFSInodeStore implements IInodeStore {
     // ── Read ───────────────────────────────────────────────────────────────────
 
     async getInode(ino: number): Promise<InodeRecord | null> {
+        if (ino < 0) return null; // virtual ino — not yet registered
+
         const entry = await this.db.getEntry(ino);
         if (!entry) return null;
+
         // VFS-internal paths (asset dirs: _name, internal dirs: __name) are stored
         // only in the sidecar DB — they have no physical counterpart on disk.
         // Skip the filesystem stat for these; trust the DB record.
@@ -77,8 +85,17 @@ export class LocalFSInodeStore implements IInodeStore {
         if (!stat) return null;
 
         const type: 'file' | 'directory' = stat.isDirectory ? 'directory' : 'file';
-        const ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
 
+        // Check if already tracked in DB (read-only).
+        const existingIno = await this.db.getInoForRel(childRel);
+        if (existingIno !== null) {
+            return { ino: existingIno, parentIno, name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 };
+        }
+
+        // File exists on disk but not in DB. Register it now.
+        // Safe: txQueue in LocalFSBackend serializes all operations,
+        // and registerPath is idempotent (INSERT OR IGNORE).
+        const ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
         return { ino, parentIno, name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 };
     }
 
@@ -100,7 +117,11 @@ export class LocalFSInodeStore implements IInodeStore {
             const stat = await this.fsOps.stat(joinPath(realDir, entry.name));
             if (!stat) continue;
 
-            const ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
+            // Use getInoForRel first (read-only), then registerPath only if needed.
+            let ino = await this.db.getInoForRel(childRel);
+            if (ino === null) {
+                ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
+            }
             results.push({ ino, parentIno, name: entry.name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 });
         }
 

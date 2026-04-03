@@ -3,11 +3,7 @@
  *
  * LocalFSBackend — IStorageBackend that makes a local directory transparent to VFS.
  *
- * Storage layout:
- *   rootDir/         ← real files, readable by any external tool
- *   sidecarDir/
- *   ├── index.db     ← ISidecarDb (ino↔path mapping, meta_ext, staging)
- *   └── staging/     ← temp content written before putInode (see putData docs)
+ * ## Transaction architecture
  *
  * Two injection points for environment-specific implementations:
  *   createDb? — defaults to BetterSqliteSidecarDb (node:better-sqlite3)
@@ -15,8 +11,22 @@
  *   createFs? — defaults to NodeFsOps (node:fs)
  *               override with TauriFsOps for Tauri WebView
  *
- * With both injected, the package has zero node:fs / node:better-sqlite3
- * runtime dependency in the Tauri WebView bundle.
+ * ## SQLITE_BUSY prevention
+ *
+ * The root cause of SQLITE_BUSY in the Tauri path was holding BEGIN IMMEDIATE
+ * across async boundaries while using a sqlx connection pool:
+ *
+ *   1. _execTx calls await db.begin() → connection A issues BEGIN IMMEDIATE
+ *   2. _execTx awaits fn(scope) — yields the event loop
+ *   3. Inside fn, stores call await this.db.xxx() → pool checks out connection B
+ *   4. Connection B has no busy_timeout and cannot write while A holds the lock
+ *   5. SQLITE_BUSY
+ *
+ * Fix: _execTx holds NO explicit transaction. txQueue provides operation-level
+ * serialization (one fn at a time). Multi-statement atomicity is handled inside
+ * each DB method that needs it (see BetterSqliteSidecarDb.syncTags,
+ * registerPath — db.transaction() wrappers; TauriSqlSidecarDb.syncTags —
+ * BEGIN/COMMIT scoped within the method, never spanning async FS I/O).
  */
 
 import type {
@@ -28,10 +38,6 @@ import type {
 } from '@itookit/common';
 import type { ISidecarDb } from './db/sidecar-interface';
 import type { IFsOps } from './fs/fs-ops';
-// BetterSqliteSidecarDb and NodeFsOps are loaded via dynamic import in the
-// default factories below, so they are NEVER statically bundled into the
-// Tauri WebView. The Tauri app always supplies createDb / createFs, so
-// the dynamic chunks are never fetched.
 import { LocalFSInodeStore } from './stores/localfs-inode-store';
 import { LocalFSMetaStore }  from './stores/localfs-meta-store';
 import { LocalFSContentStore } from './stores/localfs-content-store';
@@ -81,7 +87,13 @@ export class LocalFSBackend implements IStorageBackend {
     content!: IContentStore;
 
     private sidecarDb: ISidecarDb | null = null;
-    private txQueue:   Promise<unknown>  = Promise.resolve();
+
+    /**
+     * Serialization queue: ensures at most one runInTransaction callback runs
+     * at a time. This is the SOLE concurrency guard — no explicit SQLite
+     * transaction is held across the async fn boundary.
+     */
+    private txQueue: Promise<unknown> = Promise.resolve();
 
     private readonly rootDir:    string;
     private readonly sidecarDir: string;
@@ -90,8 +102,6 @@ export class LocalFSBackend implements IStorageBackend {
     private readonly createFs:   () => IFsOps | Promise<IFsOps>;
 
     constructor(options: LocalFSBackendOptions) {
-        // Callers must pass absolute paths. Tauri provides them from invoke(),
-        // Node.js callers should use path.resolve() before passing in.
         this.rootDir    = options.rootDir;
         this.sidecarDir = options.sidecarDir;
         this.stagingDir = joinPath(this.sidecarDir, 'staging');
@@ -136,7 +146,9 @@ export class LocalFSBackend implements IStorageBackend {
         _mode: 'readonly' | 'readwrite',
         fn: (scope: ITransactionScope) => Promise<T>,
     ): Promise<T> {
-        const result = this.txQueue.then(() => this.execTx(fn));
+        const result = this.txQueue.then(() => this._execTx(fn));
+        // Swallow rejections on the queue tail so a failed tx doesn't poison
+        // subsequent ones.
         this.txQueue = result.catch(() => undefined);
         return result;
     }
@@ -145,23 +157,17 @@ export class LocalFSBackend implements IStorageBackend {
 
     // ── Private ────────────────────────────────────────────────────────────────
 
-    private async execTx<T>(fn: (scope: ITransactionScope) => Promise<T>): Promise<T> {
-        const db = this.assertOpen();
-        await db.begin();
-        try {
-            const result = await fn({ inodes: this.inodes, meta: this.meta, content: this.content });
-            await db.commit();
-            return result;
-        } catch (e) {
-            try { await db.rollback(); } catch { /* ignore */ }
-            throw e;
-        }
+    private async _execTx<T>(fn: (scope: ITransactionScope) => Promise<T>): Promise<T> {
+        // txQueue guarantees only one _execTx runs at a time.
+        // No explicit BEGIN/COMMIT is held here — doing so across async
+        // boundaries causes SQLITE_BUSY on connection-pooled backends (Tauri).
+        // Each DB method that needs multi-statement atomicity wraps itself
+        // internally (BetterSqliteSidecarDb: db.transaction(); Tauri: per-method
+        // BEGIN/COMMIT scoped within the method, not spanning FS I/O).
+        return fn({ inodes: this.inodes, meta: this.meta, content: this.content });
     }
 
-    private assertOpen(): ISidecarDb {
-        if (!this.sidecarDb) throw new Error('LocalFSBackend is not open — call init() first');
-        return this.sidecarDb;
-    }
+
 }
 
 // Default factories — dynamic imports keep node:fs / better-sqlite3 out of

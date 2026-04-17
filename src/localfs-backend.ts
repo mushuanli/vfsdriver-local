@@ -109,6 +109,9 @@ export class LocalFSBackend implements IStorageBackend {
         this.createFs   = options.createFs ?? defaultCreateFs;
     }
 
+    /** Content directory for internal (__ prefix) VFS paths. */
+    get internalContentDir(): string { return joinPath(this.sidecarDir, 'vfs-internal'); }
+
     // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async init(): Promise<void> {
@@ -118,6 +121,7 @@ export class LocalFSBackend implements IStorageBackend {
         await ensureDir(fsOps, this.rootDir);
         await ensureDir(fsOps, this.sidecarDir);
         await ensureDir(fsOps, this.stagingDir);
+        await ensureDir(fsOps, this.internalContentDir);
 
         const dbPath = joinPath(this.sidecarDir, 'index.db');
         this.sidecarDb = await this.createDb(dbPath);
@@ -129,9 +133,9 @@ export class LocalFSBackend implements IStorageBackend {
             if (!exists) await this.sidecarDb.clearStage(entry.ref);
         }
 
-        this.inodes  = new LocalFSInodeStore(this.rootDir, this.sidecarDb, fsOps);
-        this.meta    = new LocalFSMetaStore(this.rootDir, this.sidecarDb, fsOps);
-        this.content = new LocalFSContentStore(this.rootDir, this.stagingDir, this.sidecarDb, fsOps);
+        this.inodes  = new LocalFSInodeStore(this.rootDir, this.internalContentDir, this.sidecarDb, fsOps);
+        this.meta    = new LocalFSMetaStore(this.rootDir, this.internalContentDir, this.sidecarDb, fsOps);
+        this.content = new LocalFSContentStore(this.rootDir, this.internalContentDir, this.stagingDir, this.sidecarDb, fsOps);
     }
 
     async close(): Promise<void> {

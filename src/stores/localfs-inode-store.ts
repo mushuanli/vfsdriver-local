@@ -3,8 +3,21 @@
  *
  * IInodeStore backed by real filesystem via IFsOps + ISidecarDb.
  *
- * lookup() only writes to the DB when a file exists on disk but has no
- * DB entry yet (registerPath is idempotent). This is safe because:
+ * ## Path classification
+ *
+ * Paths are split into three categories:
+ *   - Regular paths ("note.md", "docs/")  → rootDir, full disk I/O
+ *   - Asset dirs   ("_note.md/", ...)     → rootDir, real dirs on disk
+ *   - Internal     ("__config/", ...)     → DB-only dir; content at internalContentDir
+ *
+ * The distinction is made by hasInternalSegment(): only `__` prefix segments
+ * are "internal".  Single-`_` segments (asset dirs) are treated exactly like
+ * regular paths — real directories created under rootDir.
+ *
+ * ## Concurrency
+ *
+ * lookup() only writes to the DB when a file exists on disk but has no DB
+ * entry yet (registerPath is idempotent). This is safe because:
  * - LocalFSBackend.txQueue ensures no two operations run concurrently.
  * - registerPath uses INSERT OR IGNORE, so duplicate calls are harmless.
  */
@@ -12,13 +25,18 @@
 import type { IInodeStore, InodeRecord, InodeWalkOptions } from '@itookit/common';
 import type { ISidecarDb } from '../db/sidecar-interface';
 import type { IFsOps } from '../fs/fs-ops';
-import { joinPath, basenamePath, dirnamePath } from '../utils/fs-utils';
+import {
+    joinPath, basenamePath, dirnamePath,
+    hasInternalSegment, isInternalSeg,
+} from '../utils/fs-utils';
 
 export const ROOT_INO = 1;
 
 export class LocalFSInodeStore implements IInodeStore {
     constructor(
         private readonly rootDir: string,
+        /** sidecarDir/vfs-internal — where __ prefix content files live */
+        private readonly internalContentDir: string,
         private readonly db: ISidecarDb,
         private readonly fsOps: IFsOps,
     ) { }
@@ -37,29 +55,24 @@ export class LocalFSInodeStore implements IInodeStore {
         const entry = await this.db.getEntry(ino);
         if (!entry) return null;
 
-        // VFS-internal paths (asset dirs: _name, internal dirs: __name) are stored
-        // only in the sidecar DB — they have no physical counterpart on disk.
-        // Skip the filesystem stat for these; trust the DB record.
-        const isVfsInternal = entry.rel.split('/').some(seg => seg.startsWith('_'));
-        if (!isVfsInternal) {
+        // Internal paths (__config/, ...) exist only in the sidecar DB.
+        // Asset dirs (_note.md/) and regular paths exist on disk — stat them.
+        if (!hasInternalSegment(entry.rel)) {
             const stat = await this.fsOps.stat(this.toRealPath(entry.rel));
-            if (!stat) return null;
+            if (!stat) {
+                // File disappeared from disk outside VFS — lazily clean up orphan.
+                await this.db.deletePath(ino);
+                return null;
+            }
         }
         return this.buildRecord(ino, entry.rel, entry.type as 'file' | 'directory');
     }
 
     // ── Patcher helper ──────────────────────────────────────────────────────────
 
-    /**
-     * Ensures the inode record for a directory at `rel` has a proper entry in
-     * the sidecar DB so that `getInoForRel(rel)` returns a non-null value.
-     * Called by buildRecord when a parent directory is not yet registered.
-     */
     private async ensureParentIno(parentRel: string): Promise<number> {
         const existing = await this.db.getInoForRel(parentRel);
         if (existing !== null) return existing;
-        // Parent directory exists on disk but was never explicitly registered.
-        // Register it now so subsequent buildRecord calls resolve correctly.
         const stat = await this.fsOps.stat(this.toRealPath(parentRel));
         const createdAt = stat?.birthtimeMs ?? Date.now();
         return this.db.registerPath(parentRel, 'directory', createdAt);
@@ -71,30 +84,31 @@ export class LocalFSInodeStore implements IInodeStore {
 
         const childRel = parentRel === '' ? name : `${parentRel}/${name}`;
 
-        // VFS-internal names (_name, __name) live only in the sidecar DB.
-        // Check the DB directly instead of stat-ing the filesystem.
-        if (name.startsWith('_')) {
+        // If the child path contains a __ segment (e.g. parent is __config/ or
+        // child name itself is __config), resolve from DB only — no disk I/O.
+        if (hasInternalSegment(childRel)) {
             const ino = await this.db.getInoForRel(childRel);
             if (ino === null) return null;
             const dbEntry = await this.db.getEntry(ino);
             if (!dbEntry) return null;
-            return { ino, parentIno, name, type: dbEntry.type as 'file' | 'directory', createdAt: 0, nlink: 1 };
+            return {
+                ino, parentIno, name,
+                type: dbEntry.type as 'file' | 'directory',
+                createdAt: 0, nlink: 1,
+            };
         }
 
+        // Regular paths and asset dirs (_name/) → check the real filesystem.
         const stat = await this.fsOps.stat(this.toRealPath(childRel));
         if (!stat) return null;
 
         const type: 'file' | 'directory' = stat.isDirectory ? 'directory' : 'file';
 
-        // Check if already tracked in DB (read-only).
         const existingIno = await this.db.getInoForRel(childRel);
         if (existingIno !== null) {
             return { ino: existingIno, parentIno, name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 };
         }
 
-        // File exists on disk but not in DB. Register it now.
-        // Safe: txQueue in LocalFSBackend serializes all operations,
-        // and registerPath is idempotent (INSERT OR IGNORE).
         const ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
         return { ino, parentIno, name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 };
     }
@@ -103,6 +117,17 @@ export class LocalFSInodeStore implements IInodeStore {
         const parentRel = await this.db.getRelPath(parentIno);
         if (parentRel === null) return [];
 
+        // Internal parent (e.g. __config/): no disk directory — list from DB only.
+        if (hasInternalSegment(parentRel)) {
+            const dbChildren = await this.db.listDirectChildren(parentRel);
+            return dbChildren.map(child => ({
+                ino: child.ino, parentIno, name: child.name,
+                type: child.type as 'file' | 'directory',
+                createdAt: child.createdAt, nlink: 1,
+            }));
+        }
+
+        // Regular / asset-dir parent: read from disk.
         const realDir = this.toRealPath(parentRel);
         const entries = await this.fsOps.readDir(realDir);
 
@@ -117,7 +142,6 @@ export class LocalFSInodeStore implements IInodeStore {
             const stat = await this.fsOps.stat(joinPath(realDir, entry.name));
             if (!stat) continue;
 
-            // Use getInoForRel first (read-only), then registerPath only if needed.
             let ino = await this.db.getInoForRel(childRel);
             if (ino === null) {
                 ino = await this.db.registerPath(childRel, type, stat.birthtimeMs || Date.now());
@@ -125,12 +149,16 @@ export class LocalFSInodeStore implements IInodeStore {
             results.push({ ino, parentIno, name: entry.name, type, createdAt: stat.birthtimeMs || Date.now(), nlink: 1 });
         }
 
-        // VFS-internal dirs (asset dirs `_name/`, `__config/`) are not created on the
-        // real filesystem (see putInode). Merge them in from the sidecar DB.
+        // Merge DB-only children: only __ prefix dirs (internal config).
+        // Single _ prefix (asset dirs) now live on disk and appear via readDir above.
         const dbChildren = await this.db.listDirectChildren(parentRel);
         for (const child of dbChildren) {
-            if (!realNames.has(child.name)) {
-                results.push({ ino: child.ino, parentIno, name: child.name, type: child.type, createdAt: child.createdAt, nlink: 1 });
+            if (!realNames.has(child.name) && isInternalSeg(child.name)) {
+                results.push({
+                    ino: child.ino, parentIno, name: child.name,
+                    type: child.type as 'file' | 'directory',
+                    createdAt: child.createdAt, nlink: 1,
+                });
             }
         }
 
@@ -158,30 +186,45 @@ export class LocalFSInodeStore implements IInodeStore {
         }
 
         const existingRel = await this.db.getRelPath(inode.ino);
-        if (existingRel !== null) return; // already tracked (re-mount or upsert)
+        if (existingRel !== null) return; // already tracked
 
         const parentRel = (await this.db.getRelPath(inode.parentIno)) ?? '';
         const rel = parentRel === '' ? inode.name : `${parentRel}/${inode.name}`;
-        const realPath = this.toRealPath(rel);
         const sidecarType: 'file' | 'directory' = inode.type === 'directory' ? 'directory' : 'file';
+        const isInternal = hasInternalSegment(rel);
 
         if (inode.type === 'directory') {
-            // Asset dirs (_filename/) and internal dirs (__config/) are VFS-internal
-            // metadata. For LocalFS the rootDir is the user's real filesystem, so we
-            // must NOT create these on disk — register only in the sidecar DB.
-            const isVfsInternal = inode.name.startsWith('_');
-            if (!isVfsInternal) {
-                await this.fsOps.mkdir(realPath);
+            if (!isInternal) {
+                // Regular dirs + asset dirs (_name/) → create real directory on disk.
+                await this.fsOps.mkdir(this.toRealPath(rel));
             }
+            // __ prefix dirs: DB-only, no disk creation needed.
         } else {
-            const stagePath = await this.db.getStagePath(String(inode.ino));
-            await this.fsOps.mkdir(dirnamePath(realPath));
-            if (stagePath) {
-                await this.fsOps.rename(stagePath, realPath);
-                await this.db.clearStage(String(inode.ino));
+            if (!isInternal) {
+                // Regular files + files inside asset dirs → real files under rootDir.
+                const realPath = this.toRealPath(rel);
+                const stagePath = await this.db.getStagePath(String(inode.ino));
+                await this.fsOps.mkdir(dirnamePath(realPath));
+                if (stagePath) {
+                    await this.fsOps.rename(stagePath, realPath);
+                    await this.db.clearStage(String(inode.ino));
+                } else {
+                    const already = await this.fsOps.exists(realPath);
+                    if (!already) await this.fsOps.writeFile(realPath, new ArrayBuffer(0));
+                }
             } else {
-                const already = await this.fsOps.exists(realPath);
-                if (!already) await this.fsOps.writeFile(realPath, new ArrayBuffer(0));
+                // Internal files (e.g. __config/history.yaml) → content goes to
+                // internalContentDir; move staging there if present.
+                const targetPath = joinPath(this.internalContentDir, rel);
+                const stagePath = await this.db.getStagePath(String(inode.ino));
+                await this.fsOps.mkdir(dirnamePath(targetPath));
+                if (stagePath) {
+                    await this.fsOps.rename(stagePath, targetPath);
+                    await this.db.clearStage(String(inode.ino));
+                } else {
+                    const already = await this.fsOps.exists(targetPath);
+                    if (!already) await this.fsOps.writeFile(targetPath, new ArrayBuffer(0));
+                }
             }
         }
 
@@ -215,19 +258,28 @@ export class LocalFSInodeStore implements IInodeStore {
         const newRel = newParentRel === '' ? newName : `${newParentRel}/${newName}`;
         if (newRel === oldRel) return;
 
-        await this.fsOps.mkdir(dirnamePath(this.toRealPath(newRel)));
-        await this.fsOps.rename(this.toRealPath(oldRel), this.toRealPath(newRel));
+        const isInternal = hasInternalSegment(oldRel);
+        const oldPath = isInternal ? joinPath(this.internalContentDir, oldRel) : this.toRealPath(oldRel);
+        const newPath = isInternal ? joinPath(this.internalContentDir, newRel) : this.toRealPath(newRel);
+
+        await this.fsOps.mkdir(dirnamePath(newPath));
+        await this.fsOps.rename(oldPath, newPath);
         await this.db.updateRel(ino, newRel);
     }
 
     async deleteInode(ino: number): Promise<void> {
         const entry = await this.db.getEntry(ino);
         if (!entry) return;
-        const realPath = this.toRealPath(entry.rel);
+
+        const isInternal = hasInternalSegment(entry.rel);
+        const path = isInternal
+            ? joinPath(this.internalContentDir, entry.rel)
+            : this.toRealPath(entry.rel);
+
         if (entry.type === 'directory') {
-            await this.fsOps.rmdir(realPath);
+            await this.fsOps.rmdir(path);
         } else {
-            await this.fsOps.unlink(realPath);
+            await this.fsOps.unlink(path);
         }
         await this.db.deletePath(ino);
     }
@@ -285,8 +337,20 @@ export class LocalFSInodeStore implements IInodeStore {
     async hasChildren(parentIno: number): Promise<boolean> {
         const parentRel = await this.db.getRelPath(parentIno);
         if (parentRel === null) return false;
+
+        if (hasInternalSegment(parentRel)) {
+            // Internal dir: no disk presence — check DB only.
+            const dbChildren = await this.db.listDirectChildren(parentRel);
+            return dbChildren.length > 0;
+        }
+
         const entries = await this.fsOps.readDir(this.toRealPath(parentRel));
-        return entries.length > 0;
+        if (entries.length > 0) return true;
+
+        // Also check for __ prefix DB-only children (e.g. __config/ with no
+        // disk-visible siblings yet).
+        const dbChildren = await this.db.listDirectChildren(parentRel);
+        return dbChildren.some(c => isInternalSeg(c.name));
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
@@ -297,9 +361,6 @@ export class LocalFSInodeStore implements IInodeStore {
 
     private async buildRecord(ino: number, rel: string, type: 'file' | 'directory'): Promise<InodeRecord> {
         const name = rel === '' ? '' : basenamePath(rel);
-        // Compute the true parentIno from the rel path instead of hardcoding ROOT_INO.
-        // Without this, _buildAbsPath in ModuleFS walks up only one level (the file
-        // itself) and produces wrong paths like '/guide.md' instead of '/docs/guide.md'.
         const slashIdx = rel.lastIndexOf('/');
         let parentIno = ROOT_INO;
         if (slashIdx > 0) {

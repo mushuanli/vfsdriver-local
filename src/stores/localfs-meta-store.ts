@@ -6,11 +6,13 @@
 import type { IMetaStore, MetaRecord, MetaWalkOptions } from '@itookit/common';
 import type { ISidecarDb, MetaExtRow } from '../db/sidecar-interface';
 import type { IFsOps } from '../fs/fs-ops';
-import { joinPath } from '../utils/fs-utils';
+import { joinPath, hasInternalSegment } from '../utils/fs-utils';
 
 export class LocalFSMetaStore implements IMetaStore {
     constructor(
         private readonly rootDir: string,
+        /** sidecarDir/vfs-internal — where __ prefix content files are stored */
+        private readonly internalContentDir: string,
         private readonly db: ISidecarDb,
         private readonly fsOps: IFsOps,
     ) { }
@@ -21,23 +23,32 @@ export class LocalFSMetaStore implements IMetaStore {
         const rel = await this.db.getRelPath(ino);
         if (rel === null) return null;
 
-        const isVfsInternal = rel.split('/').some(seg => seg.startsWith('_'));
-        const realPath = rel === '' ? this.rootDir : joinPath(this.rootDir, rel);
+        // Internal paths (__config/, ...) have no presence in rootDir.
+        // Asset dirs (_name/) and regular paths exist on disk under rootDir.
+        const isInternal = hasInternalSegment(rel);
+        const resolvedPath = isInternal
+            ? joinPath(this.internalContentDir, rel)
+            : (rel === '' ? this.rootDir : joinPath(this.rootDir, rel));
 
         let size: number;
         let mtimeMs: number;
         let isDirectory: boolean;
 
-        if (isVfsInternal) {
-            // VFS-internal paths (_asset/, __config/) exist only in the sidecar DB,
-            // not on the real filesystem. Synthesise stat-like values from the DB entry.
+        if (isInternal) {
+            // Internal directories are DB-only; files are in internalContentDir.
             const entry = await this.db.getEntry(ino);
             if (!entry) return null;
             isDirectory = entry.type === 'directory';
-            size = 0;
-            mtimeMs = Date.now();
+            if (isDirectory) {
+                size = 0;
+                mtimeMs = Date.now();
+            } else {
+                const stat = await this.fsOps.stat(resolvedPath);
+                size = stat?.size ?? 0;
+                mtimeMs = stat?.mtimeMs ?? Date.now();
+            }
         } else {
-            const stat = await this.fsOps.stat(realPath);
+            const stat = await this.fsOps.stat(resolvedPath);
             if (!stat) return null;
             isDirectory = stat.isDirectory;
             size = isDirectory ? 0 : stat.size;

@@ -1,16 +1,22 @@
 /**
  * @file vfsdriver-localfs/src/stores/localfs-content-store.ts
  * IContentStore backed by real filesystem via IFsOps. No direct node:fs import.
+ *
+ * Content routing:
+ *   - Regular files + files inside asset dirs (_name/) → rootDir/rel
+ *   - Files inside internal dirs (__config/, ...)      → internalContentDir/rel
  */
 
 import type { IContentStore } from '@itookit/common';
 import type { ISidecarDb } from '../db/sidecar-interface';
 import type { IFsOps } from '../fs/fs-ops';
-import { joinPath } from '../utils/fs-utils';
+import { joinPath, hasInternalSegment } from '../utils/fs-utils';
 
 export class LocalFSContentStore implements IContentStore {
     constructor(
         private readonly rootDir: string,
+        /** sidecarDir/vfs-internal — stores content for __ prefix paths */
+        private readonly internalContentDir: string,
         private readonly stagingDir: string,
         private readonly db: ISidecarDb,
         private readonly fsOps: IFsOps,
@@ -82,6 +88,9 @@ export class LocalFSContentStore implements IContentStore {
         if (isNaN(ino)) return null;
         const rel = await this.db.getRelPath(ino);
         if (rel === null) return null;
-        return rel === '' ? this.rootDir : joinPath(this.rootDir, rel);
+        if (rel === '') return this.rootDir;
+        // Internal paths (__config/, ...) are stored under internalContentDir.
+        if (hasInternalSegment(rel)) return joinPath(this.internalContentDir, rel);
+        return joinPath(this.rootDir, rel);
     }
 }

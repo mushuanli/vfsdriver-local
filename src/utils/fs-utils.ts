@@ -52,3 +52,25 @@ export function dirnamePath(p: string): string {
     parts.pop();
     return parts.join('/') || '/';
 }
+
+/**
+ * Returns true when a path segment is "internal" — i.e. it begins with double
+ * underscore (`__`).  These paths (e.g. `__config/`) live only in the sidecar
+ * directory and must NOT be created inside the user's rootDir.
+ *
+ * Single-underscore segments (`_note.md/`) are *asset directories* — real
+ * directories that belong to the user and ARE created on disk inside rootDir.
+ */
+export function isInternalSeg(seg: string): boolean {
+    return seg.length >= 2 && seg.startsWith('__');
+}
+
+/**
+ * Returns true if any segment of a relative path is internal (`__` prefix).
+ * Used to decide whether content/directory operations should target rootDir
+ * (false) or sidecarDir/vfs-internal/ (true).
+ */
+export function hasInternalSegment(rel: string): boolean {
+    if (!rel) return false;
+    return rel.split('/').some(isInternalSeg);
+}

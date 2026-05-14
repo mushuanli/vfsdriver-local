@@ -1,196 +1,300 @@
 /**
  * @file vfsdriver-localfs/src/localfs-backend.ts
+ * v4.1: Path-based IStorageBackend. No ino allocation, no path_ino table.
  *
- * LocalFSBackend — IStorageBackend that makes a local directory transparent to VFS.
- *
- * ## Transaction architecture
- *
- * Two injection points for environment-specific implementations:
- *   createDb? — defaults to BetterSqliteSidecarDb (node:better-sqlite3)
- *               override with TauriSqlSidecarDb for Tauri WebView
- *   createFs? — defaults to NodeFsOps (node:fs)
- *               override with TauriFsOps for Tauri WebView
- *
- * ## SQLITE_BUSY prevention
- *
- * The root cause of SQLITE_BUSY in the Tauri path was holding BEGIN IMMEDIATE
- * across async boundaries while using a sqlx connection pool:
- *
- *   1. _execTx calls await db.begin() → connection A issues BEGIN IMMEDIATE
- *   2. _execTx awaits fn(scope) — yields the event loop
- *   3. Inside fn, stores call await this.db.xxx() → pool checks out connection B
- *   4. Connection B has no busy_timeout and cannot write while A holds the lock
- *   5. SQLITE_BUSY
- *
- * Fix: _execTx holds NO explicit transaction. txQueue provides operation-level
- * serialization (one fn at a time). Multi-statement atomicity is handled inside
- * each DB method that needs it (see BetterSqliteSidecarDb.syncTags,
- * registerPath — db.transaction() wrappers; TauriSqlSidecarDb.syncTags —
- * BEGIN/COMMIT scoped within the method, never spanning async FS I/O).
+ * Stores files directly in rootDir. Non-derivable metadata in sidecar SQLite.
+ * Internal paths (__config/…) go to sidecarDir/vfs-internal/.
  */
 
 import type {
     IStorageBackend,
-    ITransactionScope,
-    IInodeStore,
-    IMetaStore,
-    IContentStore,
+    FSNode,
+    FSFileNode,
+    FSDirectoryNode,
+    FSErrorCode,
 } from '@itookit/common';
-import type { ISidecarDb } from './db/sidecar-interface';
-import type { IFsOps } from './fs/fs-ops';
-import { LocalFSInodeStore } from './stores/localfs-inode-store';
-import { LocalFSMetaStore }  from './stores/localfs-meta-store';
-import { LocalFSContentStore } from './stores/localfs-content-store';
-import { ensureDir, cleanOrphanedStaging, joinPath } from './utils/fs-utils';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Options
-// ─────────────────────────────────────────────────────────────────────────────
+import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
+import type { IFsOps, StatResult } from './fs/fs-ops';
+import { ensureDir, cleanOrphanedStaging, joinPath, hasInternalSegment } from './utils/fs-utils';
 
 export interface LocalFSBackendOptions {
-    /**
-     * The real local directory to expose through VFS.
-     * Reads and writes go directly to files inside this directory.
-     */
     rootDir: string;
-
-    /**
-     * Private directory for sidecar SQLite + staging files.
-     * Must be OUTSIDE rootDir to avoid polluting the user's directory.
-     */
     sidecarDir: string;
-
-    /**
-     * Factory for the sidecar DB.
-     * Default: BetterSqliteSidecarDb (requires Node.js / Electron).
-     * Override: TauriSqlSidecarDb (Tauri WebView, no native addon).
-     */
     createDb?: (dbPath: string) => Promise<ISidecarDb>;
-
-    /**
-     * Factory for filesystem operations.
-     * Default: NodeFsOps (requires node:fs — Node.js / Electron only).
-     * Override: TauriFsOps (@tauri-apps/plugin-fs, runs in Tauri WebView).
-     */
     createFs?: () => IFsOps | Promise<IFsOps>;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Backend
-// ─────────────────────────────────────────────────────────────────────────────
 
 export class LocalFSBackend implements IStorageBackend {
     readonly name = 'localfs';
 
-    inodes!:  IInodeStore;
-    meta!:    IMetaStore;
-    content!: IContentStore;
-
-    private sidecarDb: ISidecarDb | null = null;
-
-    /**
-     * Serialization queue: ensures at most one runInTransaction callback runs
-     * at a time. This is the SOLE concurrency guard — no explicit SQLite
-     * transaction is held across the async fn boundary.
-     */
-    private txQueue: Promise<unknown> = Promise.resolve();
-
-    private readonly rootDir:    string;
+    private db: ISidecarDb | null = null;
+    private fsOps!: IFsOps;
+    private readonly rootDir: string;
     private readonly sidecarDir: string;
     private readonly stagingDir: string;
-    private readonly createDb:   (dbPath: string) => Promise<ISidecarDb>;
-    private readonly createFs:   () => IFsOps | Promise<IFsOps>;
+    private readonly internalDir: string;
+    private readonly _createDb: (dbPath: string) => Promise<ISidecarDb>;
+    private readonly _createFs: () => IFsOps | Promise<IFsOps>;
+    private txQueue: Promise<unknown> = Promise.resolve();
 
     constructor(options: LocalFSBackendOptions) {
-        this.rootDir    = options.rootDir;
+        this.rootDir = options.rootDir;
         this.sidecarDir = options.sidecarDir;
         this.stagingDir = joinPath(this.sidecarDir, 'staging');
-        this.createDb   = options.createDb ?? defaultCreateDb;
-        this.createFs   = options.createFs ?? defaultCreateFs;
-    }
-
-    /** Content directory for internal (__ prefix) VFS paths. */
-    get internalContentDir(): string { return joinPath(this.sidecarDir, 'vfs-internal'); }
-
-    // ── Lifecycle ──────────────────────────────────────────────────────────────
-
-    async init(): Promise<void> {
-        if (this.sidecarDb) return;
-
-        const fsOps = await this.createFs();
-        await ensureDir(fsOps, this.rootDir);
-        await ensureDir(fsOps, this.sidecarDir);
-        await ensureDir(fsOps, this.stagingDir);
-        await ensureDir(fsOps, this.internalContentDir);
-
-        const dbPath = joinPath(this.sidecarDir, 'index.db');
-        this.sidecarDb = await this.createDb(dbPath);
-
-        await cleanOrphanedStaging(fsOps, this.stagingDir);
-
-        for (const entry of await this.sidecarDb.allStaged()) {
-            const exists = await fsOps.exists(entry.path);
-            if (!exists) await this.sidecarDb.clearStage(entry.ref);
-        }
-
-        this.inodes  = new LocalFSInodeStore(this.rootDir, this.internalContentDir, this.sidecarDb, fsOps);
-        this.meta    = new LocalFSMetaStore(this.rootDir, this.internalContentDir, this.sidecarDb, fsOps);
-        this.content = new LocalFSContentStore(this.rootDir, this.internalContentDir, this.stagingDir, this.sidecarDb, fsOps);
-    }
-
-    async close(): Promise<void> {
-        if (!this.sidecarDb) return;
-        await this.sidecarDb.close();
-        this.sidecarDb = null;
-    }
-
-    // ── Transactions ───────────────────────────────────────────────────────────
-
-    async runInTransaction<T>(
-        _mode: 'readonly' | 'readwrite',
-        fn: (scope: ITransactionScope) => Promise<T>,
-    ): Promise<T> {
-        const result = this.txQueue.then(() => this._execTx(fn));
-        // Swallow rejections on the queue tail so a failed tx doesn't poison
-        // subsequent ones.
-        this.txQueue = result.catch(() => undefined);
-        return result;
+        this.internalDir = joinPath(this.sidecarDir, 'vfs-internal');
+        this._createDb = options.createDb ?? defaultCreateDb;
+        this._createFs = options.createFs ?? defaultCreateFs;
     }
 
     get dbFilePath(): string { return joinPath(this.sidecarDir, 'index.db'); }
 
-    // ── Private ────────────────────────────────────────────────────────────────
+    // ══ Lifecycle ═════════════════════════════════════════════════
 
-    private async _execTx<T>(fn: (scope: ITransactionScope) => Promise<T>): Promise<T> {
-        // txQueue guarantees only one _execTx runs at a time.
-        // No explicit BEGIN/COMMIT is held here — doing so across async
-        // boundaries causes SQLITE_BUSY on connection-pooled backends (Tauri).
-        // Each DB method that needs multi-statement atomicity wraps itself
-        // internally (BetterSqliteSidecarDb: db.transaction(); Tauri: per-method
-        // BEGIN/COMMIT scoped within the method, not spanning FS I/O).
-        return fn({ inodes: this.inodes, meta: this.meta, content: this.content });
+    async init(): Promise<void> {
+        if (this.db) return;
+        this.fsOps = await this._createFs();
+        await ensureDir(this.fsOps, this.rootDir);
+        await ensureDir(this.fsOps, this.sidecarDir);
+        await ensureDir(this.fsOps, this.stagingDir);
+        await ensureDir(this.fsOps, this.internalDir);
+        await cleanOrphanedStaging(this.fsOps, this.stagingDir);
+
+        const dbPath = joinPath(this.sidecarDir, 'index.db');
+        this.db = await this._createDb(dbPath);
+
+        // Clean up orphaned staged files from crashes
+        for (const entry of await this.db.allStaged()) {
+            if (!(await this.fsOps.exists(entry.path))) {
+                await this.db.clearStage(entry.ref);
+            }
+        }
     }
 
+    async close(): Promise<void> {
+        if (!this.db) return;
+        await this.db.close();
+        this.db = null;
+    }
 
+    // ══ Structure ════════════════════════════════════════════════
+
+    async stat(path: string): Promise<FSNode | null> {
+        const realPath = this.resolve(path);
+        const stat = await this.fsOps.stat(realPath);
+        if (!stat) return null;
+        const ext = this.db ? await this.db.getMetaExt(path) : null;
+        return toFSNode(path, stat, ext);
+    }
+
+    async list(dirPath: string): Promise<FSNode[]> {
+        const p = dirPath === '/' ? '' : dirPath;
+        const realDir = p === '' ? this.rootDir : this.resolve(p);
+        const entries = await this.fsOps.readDir(realDir);
+
+        const results: FSNode[] = [];
+        for (const entry of entries) {
+            const childPath = p === '' ? `/${entry.name}` : `${p}/${entry.name}`;
+            const realChild = joinPath(realDir, entry.name);
+            const stat = await this.fsOps.stat(realChild);
+            if (!stat) continue;
+            const ext = this.db ? await this.db.getMetaExt(childPath) : null;
+            results.push(toFSNode(childPath, stat, ext));
+        }
+        return results;
+    }
+
+    async mkdir(path: string): Promise<FSNode> {
+        const realPath = this.resolve(path);
+        await this.fsOps.mkdir(realPath);
+        const stat = await this.fsOps.stat(realPath);
+        if (!stat) throw new Error(`mkdir failed: ${path}`);
+        const node = toFSNode(path, stat, null);
+        return node;
+    }
+
+    async delete(path: string, options?: { recursive?: boolean }): Promise<void> {
+        const realPath = this.resolve(path);
+        const stat = await this.fsOps.stat(realPath);
+        if (!stat) return;
+
+        if (stat.isDirectory && options?.recursive) {
+            await this._deleteDirRecursive(realPath);
+        } else if (stat.isDirectory) {
+            await this.fsOps.rmdir(realPath);
+        } else {
+            await this.fsOps.unlink(realPath);
+        }
+
+        // Clean up sidecar metadata
+        if (this.db) {
+            await this.db.deleteMetaExt(path);
+        }
+    }
+
+    private async _deleteDirRecursive(realPath: string): Promise<void> {
+        const entries = await this.fsOps.readDir(realPath);
+        for (const entry of entries) {
+            const childPath = joinPath(realPath, entry.name);
+            if (entry.isDirectory) {
+                await this._deleteDirRecursive(childPath);
+            } else {
+                await this.fsOps.unlink(childPath);
+            }
+        }
+        await this.fsOps.rmdir(realPath);
+    }
+
+    async rename(fromPath: string, toPath: string): Promise<void> {
+        const oldPath = this.resolve(fromPath);
+        const newPath = this.resolve(toPath);
+        await this.fsOps.rename(oldPath, newPath);
+
+        // Update sidecar metadata path
+        if (this.db) {
+            const ext = await this.db.getMetaExt(fromPath);
+            if (ext) {
+                await this.db.deleteMetaExt(fromPath);
+                await this.db.upsertMetaExt({ ...ext, path: toPath });
+            }
+        }
+    }
+
+    // ══ Content ══════════════════════════════════════════════════
+
+    async read(path: string, options?: { offset?: number; length?: number }): Promise<Uint8Array> {
+        const realPath = this.resolve(path);
+        const data = await this.fsOps.readFile(realPath);
+        if (!data) throw new Error(`ENOENT: ${path}`);
+        const bytes = new Uint8Array(data);
+        if (options?.offset !== undefined) {
+            return bytes.slice(options.offset, options.length ? options.offset + options.length : undefined);
+        }
+        return bytes;
+    }
+
+    async write(path: string, content: Uint8Array): Promise<FSNode> {
+        const realPath = this.resolve(path);
+        const isInternal = hasInternalSegment(path);
+
+        // For new files without a real path yet, stage first
+        if (!isInternal && !(await this.fsOps.exists(realPath))) {
+            await this.fsOps.mkdir(this.stagingDir);
+            const stagePath = joinPath(this.stagingDir, Array.from(new TextEncoder().encode(path), b => b.toString(16).padStart(2, '0')).join(''));
+            await this.fsOps.writeFile(stagePath, content.buffer as ArrayBuffer);
+            if (this.db) await this.db.setStage(path, stagePath);
+            await this.fsOps.mkdir(joinPath(realPath, '..'));
+            await this.fsOps.rename(stagePath, realPath);
+            if (this.db) await this.db.clearStage(path);
+        } else if (isInternal) {
+            await this.fsOps.mkdir(joinPath(realPath, '..'));
+            await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
+        } else {
+            await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
+        }
+
+        const stat = await this.fsOps.stat(realPath);
+        if (!stat) throw new Error(`write failed: ${path}`);
+        const ext = this.db ? await this.db.getMetaExt(path) : null;
+        return toFSNode(path, stat, ext);
+    }
+
+    // ══ Metadata ═════════════════════════════════════════════════
+
+    async updateMetadata(path: string, metadata: Record<string, unknown>): Promise<void> {
+        const realPath = this.resolve(path);
+        if (!(await this.fsOps.exists(realPath))) return;
+        const existing = this.db ? await this.db.getMetaExt(path) : null;
+        const merged = existing?.metadata ? { ...JSON.parse(existing.metadata), ...metadata } : metadata;
+        await this._upsertMeta(path, { metadata: JSON.stringify(merged) }, existing);
+    }
+
+    async setTags(path: string, tags: string[]): Promise<void> {
+        await this._upsertMeta(path, { tags: JSON.stringify(tags) });
+        if (this.db) await this.db.syncTags(path, tags);
+    }
+
+    async getAllTags(): Promise<string[]> {
+        return this.db ? this.db.getAllDistinctTags() : [];
+    }
+
+    private async _upsertMeta(
+        path: string,
+        partial: Partial<MetaExtRow>,
+        existing?: MetaExtRow | null,
+    ): Promise<void> {
+        if (!this.db) return;
+        const prev = existing ?? await this.db.getMetaExt(path);
+        const row: MetaExtRow = {
+            path,
+            icon: partial.icon !== undefined ? partial.icon : (prev?.icon ?? null),
+            device_handler: partial.device_handler ?? prev?.device_handler ?? null,
+            is_asset_dir: partial.is_asset_dir ?? prev?.is_asset_dir ?? 0,
+            tags: partial.tags !== undefined ? partial.tags : (prev?.tags ?? null),
+            metadata: partial.metadata !== undefined ? partial.metadata : (prev?.metadata ?? null),
+            extra: partial.extra ?? prev?.extra ?? null,
+        };
+        await this.db.upsertMetaExt(row);
+    }
+
+    // ══ Helpers ══════════════════════════════════════════════════
+
+    /** Resolve a relative VFS path to an absolute filesystem path. */
+    private resolve(rel: string): string {
+        const p = rel.startsWith('/') ? rel.slice(1) : rel;
+        if (!p) return this.rootDir;
+        return hasInternalSegment(p)
+            ? joinPath(this.internalDir, p)
+            : joinPath(this.rootDir, p);
+    }
 }
 
-// Default factories — dynamic imports keep node:fs / better-sqlite3 out of
-// the static bundle. These are only ever loaded in Node.js / Electron contexts.
-async function defaultCreateDb(dbPath: string): Promise<ISidecarDb> {
-    const { BetterSqliteSidecarDb } = await import('./db/sidecar');
-    return new BetterSqliteSidecarDb(dbPath);
-}
-async function defaultCreateFs(): Promise<IFsOps> {
-    const { NodeFsOps } = await import('./fs/node-fs-ops');
-    return new NodeFsOps();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Factory shorthand
-// ─────────────────────────────────────────────────────────────────────────────
+// ══ Factory ══════════════════════════════════════════════════════
 
 export async function openLocalFSBackend(options: LocalFSBackendOptions): Promise<LocalFSBackend> {
     const backend = new LocalFSBackend(options);
     await backend.init();
     return backend;
+}
+
+async function defaultCreateDb(dbPath: string): Promise<ISidecarDb> {
+    const { BetterSqliteSidecarDb } = await import('./db/sidecar');
+    return new BetterSqliteSidecarDb(dbPath);
+}
+
+async function defaultCreateFs(): Promise<IFsOps> {
+    const { NodeFsOps } = await import('./fs/node-fs-ops');
+    return new NodeFsOps();
+}
+
+// ══ FSNode Factory ══════════════════════════════════════════════
+
+function toFSNode(path: string, stat: StatResult, ext: MetaExtRow | null): FSNode {
+    const name = path === '/' ? '' : path.split('/').pop()!;
+    const parentPath = path === '/' ? null : path.substring(0, path.lastIndexOf('/')) || '/';
+    const modifiedAt = stat.mtimeMs;
+    const base = {
+        id: path,
+        parentId: parentPath,
+        name,
+        path,
+        createdAt: stat.birthtimeMs,
+        modifiedAt,
+        version: Math.floor(modifiedAt),
+        nlink: 1,
+        icon: ext?.icon ?? undefined,
+        tags: ext?.tags ? (JSON.parse(ext.tags) as string[]) : [],
+        metadata: ext?.metadata ? (JSON.parse(ext.metadata) as Record<string, unknown>) : {},
+    };
+
+    if (stat.isDirectory) {
+        return { ...base, type: 'directory' } as FSDirectoryNode;
+    }
+
+    return {
+        ...base,
+        type: 'file',
+        size: stat.size,
+        contentHash: undefined,
+        assetDirId: undefined,
+    } as FSFileNode;
 }

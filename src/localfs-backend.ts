@@ -84,14 +84,18 @@ export class LocalFSBackend implements IStorageBackend {
             // Check if DB is corrupted and try to recover
             const dbExists = await this.fsOps.exists(dbPath);
             if (dbExists) {
-                // Test integrity of existing file
+                // Test integrity with a raw connection (no DDL, no foreign_keys)
+                // to avoid creating orphaned WAL files that conflict on retry.
                 let corrupted = true;
                 try {
-                    const { BetterSqliteSidecarDb } = await import('./db/sidecar');
-                    const probe = new BetterSqliteSidecarDb(dbPath);
-                    const health = await probe.healthCheck();
-                    await probe.close();
-                    corrupted = !health.ok;
+                    const { default: Database } = await import('better-sqlite3');
+                    const probe = new Database(dbPath, { readonly: true });
+                    try {
+                        const row = probe.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+                        corrupted = row?.integrity_check !== 'ok';
+                    } finally {
+                        probe.close();
+                    }
                 } catch {
                     corrupted = true;
                 }
@@ -324,12 +328,12 @@ export class LocalFSBackend implements IStorageBackend {
         if (!health.ok) result.healthy = false;
 
         // 3. Check meta_ext entries have corresponding files on disk
+        // Use a raw read-only connection to avoid DDL/WAL side effects
         const dbPath = joinPath(this.sidecarDir, 'index.db');
-        const { BetterSqliteSidecarDb } = await import('./db/sidecar');
-        const probeDb = new BetterSqliteSidecarDb(dbPath);
+        const { default: SqliteDb } = await import('better-sqlite3');
+        const probeDb = new SqliteDb(dbPath, { readonly: true });
         try {
-            const stmt = (probeDb as any).db.prepare('SELECT path FROM meta_ext');
-            const rows = stmt.all() as Array<{ path: string }>;
+            const rows = probeDb.prepare('SELECT path FROM meta_ext').all() as Array<{ path: string }>;
             result.totalMetaExt = rows.length;
 
             for (const row of rows) {
@@ -341,8 +345,7 @@ export class LocalFSBackend implements IStorageBackend {
             }
 
             // 4. Check meta_tags entries have corresponding meta_ext rows
-            const tagStmt = (probeDb as any).db.prepare('SELECT path, tag FROM meta_tags');
-            const tagRows = tagStmt.all() as Array<{ path: string; tag: string }>;
+            const tagRows = probeDb.prepare('SELECT path, tag FROM meta_tags').all() as Array<{ path: string; tag: string }>;
             result.totalMetaTags = tagRows.length;
 
             const metaPaths = new Set(rows.map(r => r.path));
@@ -354,8 +357,7 @@ export class LocalFSBackend implements IStorageBackend {
             }
 
             // 5. Check staging entries
-            const stagingStmt = (probeDb as any).db.prepare('SELECT path as ref, stage_path FROM staging');
-            const stagingRows = stagingStmt.all() as Array<{ ref: string; stage_path: string }>;
+            const stagingRows = probeDb.prepare('SELECT path as ref, stage_path FROM staging').all() as Array<{ ref: string; stage_path: string }>;
             for (const sr of stagingRows) {
                 if (!(await this.fsOps.exists(sr.stage_path))) {
                     result.orphanStaging.push(sr.ref);
@@ -363,7 +365,7 @@ export class LocalFSBackend implements IStorageBackend {
                 }
             }
         } finally {
-            await probeDb.close();
+            probeDb.close();
         }
 
         return result;
@@ -388,16 +390,17 @@ export class LocalFSBackend implements IStorageBackend {
         // Fix orphan meta_tags entries
         if (problems.orphanMetaTags.length > 0) {
             const dbPath = joinPath(this.sidecarDir, 'index.db');
-            const { BetterSqliteSidecarDb } = await import('./db/sidecar');
-            const probeDb = new BetterSqliteSidecarDb(dbPath);
+            const { default: SqliteDb } = await import('better-sqlite3');
+            const probeDb = new SqliteDb(dbPath);
             try {
+                probeDb.pragma('foreign_keys = OFF'); // allow deleting tags without parent
                 for (const entry of problems.orphanMetaTags) {
                     const [path, tag] = entry.split('#');
-                    (probeDb as any).db.prepare('DELETE FROM meta_tags WHERE path = ? AND tag = ?').run(path, tag);
+                    probeDb.prepare('DELETE FROM meta_tags WHERE path = ? AND tag = ?').run(path, tag);
                     fixedMetaTags++;
                 }
             } finally {
-                await probeDb.close();
+                probeDb.close();
             }
         }
 

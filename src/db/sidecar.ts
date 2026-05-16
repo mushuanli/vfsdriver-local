@@ -91,6 +91,18 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return Promise.resolve(rows);
     }
 
+    // ── health ─────────────────────────────────────────────────
+
+    healthCheck(): Promise<{ ok: boolean; error?: string }> {
+        try {
+            const row = this.db.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+            const ok = row?.integrity_check === 'ok';
+            return Promise.resolve(ok ? { ok: true } : { ok: false, error: row?.integrity_check });
+        } catch (e) {
+            return Promise.resolve({ ok: false, error: String(e) });
+        }
+    }
+
     // ── lifecycle ───────────────────────────────────────────────
 
     close(): Promise<void> {

@@ -5,7 +5,7 @@
 
 // ── Backend ──
 export { LocalFSBackend, openLocalFSBackend } from './localfs-backend';
-export type { LocalFSBackendOptions }          from './localfs-backend';
+export type { LocalFSBackendOptions, VerifyResult } from './localfs-backend';
 
 // ── Interfaces ──
 export type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';

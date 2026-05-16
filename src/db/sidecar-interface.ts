@@ -30,5 +30,8 @@ export interface ISidecarDb {
     clearStage(ref: string): Promise<void>;
     allStaged(): Promise<Array<{ ref: string; path: string }>>;
 
+    /** Run PRAGMA integrity_check etc. Returns { ok, error }. */
+    healthCheck(): Promise<{ ok: boolean; error?: string }>;
+
     close(): Promise<void>;
 }

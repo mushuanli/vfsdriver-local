@@ -15,13 +15,32 @@ import type {
 } from '@itookit/common';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
 import type { IFsOps, StatResult } from './fs/fs-ops';
-import { ensureDir, cleanOrphanedStaging, joinPath, hasInternalSegment } from './utils/fs-utils';
+import { ensureDir, cleanOrphanedStaging, joinPath, dirnamePath, hasInternalSegment } from './utils/fs-utils';
 
 export interface LocalFSBackendOptions {
     rootDir: string;
     sidecarDir: string;
     createDb?: (dbPath: string) => Promise<ISidecarDb>;
     createFs?: () => IFsOps | Promise<IFsOps>;
+}
+
+export interface VerifyResult {
+    /** True if no issues detected. */
+    healthy: boolean;
+    /** Whether all required directories exist. */
+    dirsExist: boolean;
+    /** Whether the SQLite database passes integrity check. */
+    dbHealthy: boolean;
+    /** meta_ext paths with no corresponding file on disk. */
+    orphanMetaExt: string[];
+    /** meta_tags entries (formatted as "path#tag") referencing missing meta_ext rows. */
+    orphanMetaTags: string[];
+    /** staging entries whose stage_path file is missing. */
+    orphanStaging: string[];
+    /** Total meta_ext rows checked. */
+    totalMetaExt: number;
+    /** Total meta_tags rows checked. */
+    totalMetaTags: number;
 }
 
 export class LocalFSBackend implements IStorageBackend {
@@ -35,7 +54,6 @@ export class LocalFSBackend implements IStorageBackend {
     private readonly internalDir: string;
     private readonly _createDb: (dbPath: string) => Promise<ISidecarDb>;
     private readonly _createFs: () => IFsOps | Promise<IFsOps>;
-    private txQueue: Promise<unknown> = Promise.resolve();
 
     constructor(options: LocalFSBackendOptions) {
         this.rootDir = options.rootDir;
@@ -60,7 +78,34 @@ export class LocalFSBackend implements IStorageBackend {
         await cleanOrphanedStaging(this.fsOps, this.stagingDir);
 
         const dbPath = joinPath(this.sidecarDir, 'index.db');
-        this.db = await this._createDb(dbPath);
+        try {
+            this.db = await this._createDb(dbPath);
+        } catch (err) {
+            // Check if DB is corrupted and try to recover
+            const dbExists = await this.fsOps.exists(dbPath);
+            if (dbExists) {
+                // Test integrity of existing file
+                let corrupted = true;
+                try {
+                    const { BetterSqliteSidecarDb } = await import('./db/sidecar');
+                    const probe = new BetterSqliteSidecarDb(dbPath);
+                    const health = await probe.healthCheck();
+                    await probe.close();
+                    corrupted = !health.ok;
+                } catch {
+                    corrupted = true;
+                }
+                if (corrupted) {
+                    await this.fsOps.unlink(dbPath);
+                    await ensureDir(this.fsOps, this.sidecarDir);
+                    this.db = await this._createDb(dbPath);
+                } else {
+                    throw err; // DB is healthy but _createDb still failed — rethrow
+                }
+            } else {
+                throw err; // DB doesn't exist and creation failed — rethrow
+            }
+        }
 
         // Clean up orphaned staged files from crashes
         for (const entry of await this.db.allStaged()) {
@@ -182,11 +227,11 @@ export class LocalFSBackend implements IStorageBackend {
             const stagePath = joinPath(this.stagingDir, Array.from(new TextEncoder().encode(path), b => b.toString(16).padStart(2, '0')).join(''));
             await this.fsOps.writeFile(stagePath, content.buffer as ArrayBuffer);
             if (this.db) await this.db.setStage(path, stagePath);
-            await this.fsOps.mkdir(joinPath(realPath, '..'));
+            await this.fsOps.mkdir(dirnamePath(realPath));
             await this.fsOps.rename(stagePath, realPath);
             if (this.db) await this.db.clearStage(path);
         } else if (isInternal) {
-            await this.fsOps.mkdir(joinPath(realPath, '..'));
+            await this.fsOps.mkdir(dirnamePath(realPath));
             await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
         } else {
             await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
@@ -234,6 +279,137 @@ export class LocalFSBackend implements IStorageBackend {
             extra: partial.extra ?? prev?.extra ?? null,
         };
         await this.db.upsertMetaExt(row);
+    }
+
+    // ══ Transaction ══════════════════════════════════════════════
+
+    async transaction<T>(fn: (tx: IStorageBackend) => Promise<T>): Promise<T> {
+        // Filesystem ops are individually atomic (writeFile uses temp-rename).
+        // For cross-operation ACID, a full transactional backend would be needed.
+        return fn(this);
+    }
+
+    // ══ Health ═══════════════════════════════════════════════════
+
+    async verify(): Promise<VerifyResult> {
+        const result: VerifyResult = {
+            healthy: true,
+            dirsExist: true,
+            dbHealthy: true,
+            orphanMetaExt: [],
+            orphanMetaTags: [],
+            orphanStaging: [],
+            totalMetaExt: 0,
+            totalMetaTags: 0,
+        };
+
+        // 1. Check directories exist
+        if (!(await this.fsOps.exists(this.rootDir))
+            || !(await this.fsOps.exists(this.sidecarDir))
+            || !(await this.fsOps.exists(this.stagingDir))
+            || !(await this.fsOps.exists(this.internalDir))) {
+            result.dirsExist = false;
+            result.healthy = false;
+            return result;
+        }
+
+        // 2. Check DB health
+        if (!this.db) {
+            result.dbHealthy = false;
+            result.healthy = false;
+            return result;
+        }
+        const health = await this.db.healthCheck();
+        result.dbHealthy = health.ok;
+        if (!health.ok) result.healthy = false;
+
+        // 3. Check meta_ext entries have corresponding files on disk
+        const dbPath = joinPath(this.sidecarDir, 'index.db');
+        const { BetterSqliteSidecarDb } = await import('./db/sidecar');
+        const probeDb = new BetterSqliteSidecarDb(dbPath);
+        try {
+            const stmt = (probeDb as any).db.prepare('SELECT path FROM meta_ext');
+            const rows = stmt.all() as Array<{ path: string }>;
+            result.totalMetaExt = rows.length;
+
+            for (const row of rows) {
+                const realPath = this.resolve(row.path);
+                if (!(await this.fsOps.exists(realPath))) {
+                    result.orphanMetaExt.push(row.path);
+                    result.healthy = false;
+                }
+            }
+
+            // 4. Check meta_tags entries have corresponding meta_ext rows
+            const tagStmt = (probeDb as any).db.prepare('SELECT path, tag FROM meta_tags');
+            const tagRows = tagStmt.all() as Array<{ path: string; tag: string }>;
+            result.totalMetaTags = tagRows.length;
+
+            const metaPaths = new Set(rows.map(r => r.path));
+            for (const tr of tagRows) {
+                if (!metaPaths.has(tr.path)) {
+                    result.orphanMetaTags.push(`${tr.path}#${tr.tag}`);
+                    result.healthy = false;
+                }
+            }
+
+            // 5. Check staging entries
+            const stagingStmt = (probeDb as any).db.prepare('SELECT path as ref, stage_path FROM staging');
+            const stagingRows = stagingStmt.all() as Array<{ ref: string; stage_path: string }>;
+            for (const sr of stagingRows) {
+                if (!(await this.fsOps.exists(sr.stage_path))) {
+                    result.orphanStaging.push(sr.ref);
+                    result.healthy = false;
+                }
+            }
+        } finally {
+            await probeDb.close();
+        }
+
+        return result;
+    }
+
+    async repair(issues?: VerifyResult): Promise<{ fixedMetaExt: number; fixedMetaTags: number; fixedStaging: number }> {
+        const problems = issues ?? await this.verify();
+        let fixedMetaExt = 0;
+        let fixedMetaTags = 0;
+        let fixedStaging = 0;
+
+        if (!this.db) return { fixedMetaExt, fixedMetaTags, fixedStaging };
+
+        // Fix orphan meta_ext entries
+        if (problems.orphanMetaExt.length > 0) {
+            for (const path of problems.orphanMetaExt) {
+                await this.db.deleteMetaExt(path);
+                fixedMetaExt++;
+            }
+        }
+
+        // Fix orphan meta_tags entries
+        if (problems.orphanMetaTags.length > 0) {
+            const dbPath = joinPath(this.sidecarDir, 'index.db');
+            const { BetterSqliteSidecarDb } = await import('./db/sidecar');
+            const probeDb = new BetterSqliteSidecarDb(dbPath);
+            try {
+                for (const entry of problems.orphanMetaTags) {
+                    const [path, tag] = entry.split('#');
+                    (probeDb as any).db.prepare('DELETE FROM meta_tags WHERE path = ? AND tag = ?').run(path, tag);
+                    fixedMetaTags++;
+                }
+            } finally {
+                await probeDb.close();
+            }
+        }
+
+        // Fix orphan staging entries
+        if (problems.orphanStaging.length > 0) {
+            for (const ref of problems.orphanStaging) {
+                await this.db.clearStage(ref);
+                fixedStaging++;
+            }
+        }
+
+        return { fixedMetaExt, fixedMetaTags, fixedStaging };
     }
 
     // ══ Helpers ══════════════════════════════════════════════════

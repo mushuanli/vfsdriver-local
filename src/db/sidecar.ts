@@ -84,28 +84,6 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return Promise.resolve(rows.map(r => r.path));
     }
 
-    // ── staging ─────────────────────────────────────────────────
-
-    getStagePath(ref: string): Promise<string | null> {
-        const row = this.db.prepare('SELECT path FROM staging WHERE path = ?').get(ref) as { path: string } | undefined;
-        return Promise.resolve(row?.path ?? null);
-    }
-
-    setStage(ref: string, stagePath: string): Promise<void> {
-        this.db.prepare('INSERT OR REPLACE INTO staging (path, stage_path) VALUES (?, ?)').run(ref, stagePath);
-        return Promise.resolve();
-    }
-
-    clearStage(ref: string): Promise<void> {
-        this.db.prepare('DELETE FROM staging WHERE path = ?').run(ref);
-        return Promise.resolve();
-    }
-
-    allStaged(): Promise<Array<{ ref: string; path: string }>> {
-        const rows = this.db.prepare('SELECT path as ref, stage_path as path FROM staging').all() as Array<{ ref: string; path: string }>;
-        return Promise.resolve(rows);
-    }
-
     // ── health ─────────────────────────────────────────────────
 
     healthCheck(): Promise<{ ok: boolean; error?: string }> {

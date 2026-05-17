@@ -24,12 +24,6 @@ export interface ISidecarDb {
     getAllDistinctTags(): Promise<string[]>;
     queryByTag(tag: string): Promise<string[]>;
 
-    // ── staging ──
-    getStagePath(ref: string): Promise<string | null>;
-    setStage(ref: string, stagePath: string): Promise<void>;
-    clearStage(ref: string): Promise<void>;
-    allStaged(): Promise<Array<{ ref: string; path: string }>>;
-
     /** Run PRAGMA integrity_check etc. Returns { ok, error }. */
     healthCheck(): Promise<{ ok: boolean; error?: string }>;
 

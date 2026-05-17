@@ -35,10 +35,4 @@ CREATE TABLE IF NOT EXISTS meta_tags (
     PRIMARY KEY (path, tag)
 );
 CREATE INDEX IF NOT EXISTS idx_meta_tags_tag ON meta_tags(tag);
-
--- Content staging for atomic write-before-commit
-CREATE TABLE IF NOT EXISTS staging (
-    path       TEXT PRIMARY KEY,
-    stage_path TEXT NOT NULL
-);
 `;

@@ -15,7 +15,7 @@ import type {
 } from '@itookit/common';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
 import type { IFsOps, StatResult } from './fs/fs-ops';
-import { ensureDir, cleanOrphanedStaging, joinPath, dirnamePath, hasInternalSegment } from './utils/fs-utils';
+import { ensureDir, joinPath, hasInternalSegment } from './utils/fs-utils';
 
 export interface LocalFSBackendOptions {
     rootDir: string;
@@ -35,8 +35,6 @@ export interface VerifyResult {
     orphanMetaExt: string[];
     /** meta_tags entries (formatted as "path#tag") referencing missing meta_ext rows. */
     orphanMetaTags: string[];
-    /** staging entries whose stage_path file is missing. */
-    orphanStaging: string[];
     /** Total meta_ext rows checked. */
     totalMetaExt: number;
     /** Total meta_tags rows checked. */
@@ -50,7 +48,6 @@ export class LocalFSBackend implements IStorageBackend {
     private fsOps!: IFsOps;
     private readonly rootDir: string;
     private readonly sidecarDir: string;
-    private readonly stagingDir: string;
     private readonly internalDir: string;
     private readonly _createDb: (dbPath: string) => Promise<ISidecarDb>;
     private readonly _createFs: () => IFsOps | Promise<IFsOps>;
@@ -58,7 +55,6 @@ export class LocalFSBackend implements IStorageBackend {
     constructor(options: LocalFSBackendOptions) {
         this.rootDir = options.rootDir;
         this.sidecarDir = options.sidecarDir;
-        this.stagingDir = joinPath(this.sidecarDir, 'staging');
         this.internalDir = joinPath(this.sidecarDir, 'vfs-internal');
         this._createDb = options.createDb ?? defaultCreateDb;
         this._createFs = options.createFs ?? defaultCreateFs;
@@ -73,9 +69,7 @@ export class LocalFSBackend implements IStorageBackend {
         this.fsOps = await this._createFs();
         await ensureDir(this.fsOps, this.rootDir);
         await ensureDir(this.fsOps, this.sidecarDir);
-        await ensureDir(this.fsOps, this.stagingDir);
         await ensureDir(this.fsOps, this.internalDir);
-        await cleanOrphanedStaging(this.fsOps, this.stagingDir);
 
         const dbPath = joinPath(this.sidecarDir, 'index.db');
         try {
@@ -108,13 +102,6 @@ export class LocalFSBackend implements IStorageBackend {
                 }
             } else {
                 throw err; // DB doesn't exist and creation failed — rethrow
-            }
-        }
-
-        // Clean up orphaned staged files from crashes
-        for (const entry of await this.db.allStaged()) {
-            if (!(await this.fsOps.exists(entry.path))) {
-                await this.db.clearStage(entry.ref);
             }
         }
     }
@@ -228,23 +215,10 @@ export class LocalFSBackend implements IStorageBackend {
 
     async write(path: string, content: Uint8Array): Promise<FSNode> {
         const realPath = this.resolve(path);
-        const isInternal = hasInternalSegment(path);
 
-        // For new files without a real path yet, stage first
-        if (!isInternal && !(await this.fsOps.exists(realPath))) {
-            await this.fsOps.mkdir(this.stagingDir);
-            const stagePath = joinPath(this.stagingDir, Array.from(new TextEncoder().encode(path), b => b.toString(16).padStart(2, '0')).join(''));
-            await this.fsOps.writeFile(stagePath, content.buffer as ArrayBuffer);
-            if (this.db) await this.db.setStage(path, stagePath);
-            await this.fsOps.mkdir(dirnamePath(realPath));
-            await this.fsOps.rename(stagePath, realPath);
-            if (this.db) await this.db.clearStage(path);
-        } else if (isInternal) {
-            await this.fsOps.mkdir(dirnamePath(realPath));
-            await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
-        } else {
-            await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
-        }
+        // IFsOps.writeFile is contractually atomic (temp-rename on POSIX).
+        // No staging/DB round-trip needed — the filesystem is the authority.
+        await this.fsOps.writeFile(realPath, content.buffer as ArrayBuffer);
 
         const stat = await this.fsOps.stat(realPath);
         if (!stat) throw new Error(`write failed: ${path}`);
@@ -312,7 +286,6 @@ export class LocalFSBackend implements IStorageBackend {
             dbHealthy: true,
             orphanMetaExt: [],
             orphanMetaTags: [],
-            orphanStaging: [],
             totalMetaExt: 0,
             totalMetaTags: 0,
         };
@@ -320,7 +293,6 @@ export class LocalFSBackend implements IStorageBackend {
         // 1. Check directories exist
         if (!(await this.fsOps.exists(this.rootDir))
             || !(await this.fsOps.exists(this.sidecarDir))
-            || !(await this.fsOps.exists(this.stagingDir))
             || !(await this.fsOps.exists(this.internalDir))) {
             result.dirsExist = false;
             result.healthy = false;
@@ -366,14 +338,6 @@ export class LocalFSBackend implements IStorageBackend {
                 }
             }
 
-            // 5. Check staging entries
-            const stagingRows = probeDb.prepare('SELECT path as ref, stage_path FROM staging').all() as Array<{ ref: string; stage_path: string }>;
-            for (const sr of stagingRows) {
-                if (!(await this.fsOps.exists(sr.stage_path))) {
-                    result.orphanStaging.push(sr.ref);
-                    result.healthy = false;
-                }
-            }
         } finally {
             probeDb.close();
         }
@@ -381,13 +345,12 @@ export class LocalFSBackend implements IStorageBackend {
         return result;
     }
 
-    async repair(issues?: VerifyResult): Promise<{ fixedMetaExt: number; fixedMetaTags: number; fixedStaging: number }> {
+    async repair(issues?: VerifyResult): Promise<{ fixedMetaExt: number; fixedMetaTags: number }> {
         const problems = issues ?? await this.verify();
         let fixedMetaExt = 0;
         let fixedMetaTags = 0;
-        let fixedStaging = 0;
 
-        if (!this.db) return { fixedMetaExt, fixedMetaTags, fixedStaging };
+        if (!this.db) return { fixedMetaExt, fixedMetaTags };
 
         // Fix orphan meta_ext entries
         if (problems.orphanMetaExt.length > 0) {
@@ -414,15 +377,7 @@ export class LocalFSBackend implements IStorageBackend {
             }
         }
 
-        // Fix orphan staging entries
-        if (problems.orphanStaging.length > 0) {
-            for (const ref of problems.orphanStaging) {
-                await this.db.clearStage(ref);
-                fixedStaging++;
-            }
-        }
-
-        return { fixedMetaExt, fixedMetaTags, fixedStaging };
+        return { fixedMetaExt, fixedMetaTags };
     }
 
     // ══ Helpers ══════════════════════════════════════════════════

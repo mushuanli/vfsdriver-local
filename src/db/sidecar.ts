@@ -30,14 +30,19 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     }
 
     upsertMetaExt(row: MetaExtRow): Promise<void> {
-        this.db.prepare(`
-            INSERT INTO meta_ext (path, icon, device_handler, is_asset_dir, tags, metadata, extra)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                icon=excluded.icon, device_handler=excluded.device_handler,
-                is_asset_dir=excluded.is_asset_dir, tags=excluded.tags,
-                metadata=excluded.metadata, extra=excluded.extra
-        `).run(row.path, row.icon, row.device_handler, row.is_asset_dir, row.tags, row.metadata, row.extra);
+        try {
+            this.db.prepare(`
+                INSERT INTO meta_ext (path, icon, device_handler, is_asset_dir, tags, metadata, extra)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    icon=excluded.icon, device_handler=excluded.device_handler,
+                    is_asset_dir=excluded.is_asset_dir, tags=excluded.tags,
+                    metadata=excluded.metadata, extra=excluded.extra
+            `).run(row.path, row.icon, row.device_handler, row.is_asset_dir, row.tags, row.metadata, row.extra);
+        } catch (e) {
+            console.error(`[LocalFS:DB] upsertMetaExt FAILED path="${row.path}"`, e);
+            throw e;
+        }
         return Promise.resolve();
     }
 
@@ -51,11 +56,21 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     syncTags(path: string, tags: string[] | undefined): Promise<void> {
         const del = this.db.prepare('DELETE FROM meta_tags WHERE path = ?');
         const ins = this.db.prepare('INSERT OR IGNORE INTO meta_tags (path, tag) VALUES (?, ?)');
-        const tx = this.db.transaction(() => {
-            del.run(path);
-            if (tags) for (const t of tags) ins.run(path, t);
-        });
-        tx();
+        try {
+            // Diagnostic: verify meta_ext row exists before inserting tags
+            const parentExists = this.db.prepare('SELECT 1 FROM meta_ext WHERE path = ?').get(path);
+            if (!parentExists) {
+                console.error(`[LocalFS:DB] syncTags: meta_ext row MISSING for path="${path}" — INSERT will fail FK`);
+            }
+            const tx = this.db.transaction(() => {
+                del.run(path);
+                if (tags) for (const t of tags) ins.run(path, t);
+            });
+            tx();
+        } catch (e) {
+            console.error(`[LocalFS:DB] syncTags FAILED path="${path}" tags=${JSON.stringify(tags)}`, e);
+            throw e;
+        }
         return Promise.resolve();
     }
 

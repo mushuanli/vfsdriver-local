@@ -200,10 +200,15 @@ export class LocalFSBackend implements IStorageBackend {
 
         // Update sidecar metadata path
         if (this.db) {
-            const ext = await this.db.getMetaExt(fromPath);
-            if (ext) {
-                await this.db.deleteMetaExt(fromPath);
-                await this.db.upsertMetaExt({ ...ext, path: toPath });
+            try {
+                const ext = await this.db.getMetaExt(fromPath);
+                if (ext) {
+                    await this.db.deleteMetaExt(fromPath);
+                    await this.db.upsertMetaExt({ ...ext, path: toPath });
+                }
+            } catch (e) {
+                console.error(`[LocalFS] rename metadata update failed from=${fromPath} to=${toPath}`, e);
+                throw e;
             }
         }
     }
@@ -258,8 +263,13 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     async setTags(path: string, tags: string[]): Promise<void> {
-        await this._upsertMeta(path, { tags: JSON.stringify(tags) });
-        if (this.db) await this.db.syncTags(path, tags);
+        try {
+            await this._upsertMeta(path, { tags: JSON.stringify(tags) });
+            if (this.db) await this.db.syncTags(path, tags);
+        } catch (e) {
+            console.error(`[LocalFS] setTags failed path=${path} tags=${JSON.stringify(tags)}`, e);
+            throw e;
+        }
     }
 
     async getAllTags(): Promise<string[]> {

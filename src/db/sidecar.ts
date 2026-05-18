@@ -7,7 +7,7 @@
 
 import Database from 'better-sqlite3';
 import type { ISidecarDb, MetaExtRow } from './sidecar-interface';
-import { DDL, SCHEMA_VERSION } from './schema';
+import { DDL } from './schema';
 
 export class BetterSqliteSidecarDb implements ISidecarDb {
     private readonly db: Database.Database;

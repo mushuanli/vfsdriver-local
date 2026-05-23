@@ -416,14 +416,12 @@ function toFSNode(path: string, stat: StatResult, ext: MetaExtRow | null): FSNod
     const parentPath = path === '/' ? null : path.substring(0, path.lastIndexOf('/')) || '/';
     const modifiedAt = stat.mtimeMs;
     const base = {
-        id: path,
-        parentId: parentPath,
+        parentPath,
         name,
         path,
         createdAt: stat.birthtimeMs,
         modifiedAt,
         version: Math.floor(modifiedAt),
-        nlink: 1,
         icon: ext?.icon ?? undefined,
         tags: ext?.tags ? (JSON.parse(ext.tags) as string[]) : [],
         metadata: ext?.metadata ? (JSON.parse(ext.metadata) as Record<string, unknown>) : {},
@@ -438,6 +436,6 @@ function toFSNode(path: string, stat: StatResult, ext: MetaExtRow | null): FSNod
         type: 'file',
         size: stat.size,
         contentHash: undefined,
-        assetDirId: undefined,
+        assetDirPath: undefined,
     } as FSFileNode;
 }

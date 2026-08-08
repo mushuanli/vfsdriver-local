@@ -6,7 +6,7 @@ export default defineConfig({
     dts: true,
     clean: true,
     sourcemap: true,
-    external: ['@itookit/common', 'better-sqlite3'],
+    external: ['@itookit/stdio', 'better-sqlite3'],
     splitting: false,
     treeshake: true,
     platform: 'node',

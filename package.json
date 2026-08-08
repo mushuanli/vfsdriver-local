@@ -30,18 +30,21 @@
     "scripts": {
         "build": "tsup",
         "dev": "tsup --watch",
+        "test": "vitest run",
+        "test:watch": "vitest",
         "prepublishOnly": "pnpm build"
     },
     "keywords": ["itookit", "vfs", "localfs", "filesystem", "native", "storage", "node"],
     "author": "lizlok@gmail.com",
     "license": "MIT",
     "dependencies": {
-        "@itookit/common": "workspace:*",
+        "@itookit/stdio": "workspace:*",
         "better-sqlite3": "^11.0.0"
     },
     "devDependencies": {
         "@types/better-sqlite3": "^7.6.0",
         "tsup": "^8.5.1",
-        "typescript": "^5.9.3"
+        "typescript": "^5.9.3",
+        "vitest": "^3.2.4"
     }
 }

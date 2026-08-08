@@ -11,7 +11,7 @@ import type {
     FSNode,
     FSFileNode,
     FSDirectoryNode,
-} from '@itookit/common';
+} from '@itookit/stdio';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
 import type { IFsOps, StatResult } from './fs/fs-ops';
 import { ensureDir, joinPath, hasInternalSegment } from './utils/fs-utils';

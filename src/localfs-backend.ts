@@ -11,6 +11,13 @@ import type {
     FSNode,
     FSFileNode,
     FSDirectoryNode,
+    IRecordStore,
+    IRecordTransaction,
+    RecordValue,
+    RecordQuery,
+    RecordQueryOptions,
+    RecordQueryResult,
+    RecordWalkOptions,
 } from '@itookit/stdio';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
 import type { IFsOps, StatResult } from './fs/fs-ops';
@@ -42,6 +49,7 @@ export interface VerifyResult {
 
 export class LocalFSBackend implements IStorageBackend {
     readonly name = 'localfs';
+    readonly records: IRecordStore;
 
     private db: ISidecarDb | null = null;
     private fsOps!: IFsOps;
@@ -57,6 +65,7 @@ export class LocalFSBackend implements IStorageBackend {
         this.internalDir = joinPath(this.sidecarDir, 'vfs-internal');
         this._createDb = options.createDb ?? defaultCreateDb;
         this._createFs = options.createFs ?? defaultCreateFs;
+        this.records = new SidecarRecordStore(() => this.requireDb());
     }
 
     get dbFilePath(): string { return joinPath(this.sidecarDir, 'index.db'); }
@@ -388,6 +397,106 @@ export class LocalFSBackend implements IStorageBackend {
         return hasInternalSegment(p)
             ? joinPath(this.internalDir, p)
             : joinPath(this.rootDir, p);
+    }
+
+    private requireDb(): ISidecarDb {
+        if (!this.db) throw new Error('LocalFS sidecar database is not initialized');
+        return this.db;
+    }
+}
+
+class SidecarRecordStore implements IRecordStore {
+    private tail: Promise<void> = Promise.resolve();
+
+    constructor(private readonly db: () => ISidecarDb) {}
+
+    getRecordField(path: string, field: string): Promise<RecordValue | undefined> {
+        return this.db().getRecordField(path, field) as Promise<RecordValue | undefined>;
+    }
+    setRecordField(path: string, field: string, value: RecordValue): Promise<void> {
+        return this.db().setRecordField(path, field, value);
+    }
+    deleteRecordField(path: string, field: string): Promise<void> {
+        return this.db().deleteRecordField(path, field);
+    }
+    async setAllRecordFields(path: string, fields: Record<string, RecordValue>): Promise<void> {
+        await this.transaction(async tx => {
+            await this.db().clearRecordFields(path);
+            for (const [field, value] of Object.entries(fields)) await tx.setRecordField(path, field, value);
+        });
+    }
+    clearRecordFields(path: string): Promise<void> { return this.db().clearRecordFields(path); }
+    async createRecordIndex(): Promise<void> {}
+    async deleteRecordIndex(): Promise<void> {}
+    async queryRecordFields(
+        path: string,
+        query: RecordQuery,
+        options?: RecordQueryOptions,
+    ): Promise<RecordQueryResult[]> {
+        const rows = await this.db().listRecordFields(path, query.field);
+        const matched = rows.filter(row => row.field === query.field && recordMatches(row.value as RecordValue, query));
+        const offset = options?.offset ?? 0;
+        return matched.slice(offset, offset + (options?.limit ?? matched.length)) as RecordQueryResult[];
+    }
+    async walkRecordFields(
+        path: string,
+        callback: (field: string, value: RecordValue) => boolean | Promise<boolean>,
+        options?: RecordWalkOptions,
+    ): Promise<{ total: number; processed: number }> {
+        const rows = await this.db().listRecordFields(path, options?.prefix);
+        let processed = 0;
+        const limit = options?.limit ?? Number.POSITIVE_INFINITY;
+        for (const row of rows.slice(options?.offset ?? 0)) {
+            if (processed >= limit || !(await callback(row.field, row.value as RecordValue))) break;
+            processed++;
+        }
+        return { total: rows.length, processed };
+    }
+    async walkRecordFieldNames(
+        path: string,
+        callback: (field: string) => boolean | Promise<boolean>,
+        options?: { prefix?: string; limit?: number },
+    ): Promise<number> {
+        let processed = 0;
+        await this.walkRecordFields(path, async field => {
+            if (!(await callback(field))) return false;
+            processed++;
+            return true;
+        }, options);
+        return processed;
+    }
+    transaction<T>(operation: (tx: IRecordTransaction) => Promise<T>): Promise<T> {
+        const run = async (): Promise<T> => {
+            const db = this.db();
+            await db.begin();
+            try {
+                const result = await operation(this);
+                await db.commit();
+                return result;
+            } catch (error) {
+                await db.rollback();
+                throw error;
+            }
+        };
+        const result = this.tail.then(run, run);
+        this.tail = result.then(() => undefined, () => undefined);
+        return result;
+    }
+}
+
+function recordMatches(value: RecordValue, query: RecordQuery): boolean {
+    const expected = query.value;
+    switch (query.operator) {
+        case '=': return value === expected;
+        case '!=': return value !== expected;
+        case '<': return typeof value === 'number' && typeof expected === 'number' && value < expected;
+        case '<=': return typeof value === 'number' && typeof expected === 'number' && value <= expected;
+        case '>': return typeof value === 'number' && typeof expected === 'number' && value > expected;
+        case '>=': return typeof value === 'number' && typeof expected === 'number' && value >= expected;
+        case 'in': return Array.isArray(expected) && expected.includes(value);
+        case 'contains': return typeof value === 'string' && typeof expected === 'string'
+            ? value.includes(expected)
+            : Array.isArray(value) && value.includes(expected);
     }
 }
 

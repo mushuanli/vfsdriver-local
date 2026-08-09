@@ -24,6 +24,17 @@ export interface ISidecarDb {
     getAllDistinctTags(): Promise<string[]>;
     queryByTag(tag: string): Promise<string[]>;
 
+    // ── SeqFile records ──
+    getRecordField(path: string, field: string): Promise<unknown | undefined>;
+    setRecordField(path: string, field: string, value: unknown): Promise<void>;
+    deleteRecordField(path: string, field: string): Promise<void>;
+    listRecordFields(path: string, prefix?: string): Promise<Array<{ field: string; value: unknown }>>;
+    clearRecordFields(path: string): Promise<void>;
+
+    begin(): Promise<void>;
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+
     /** Run PRAGMA integrity_check etc. Returns { ok, error }. */
     healthCheck(): Promise<{ ok: boolean; error?: string }>;
 

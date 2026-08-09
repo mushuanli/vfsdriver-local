@@ -84,6 +84,40 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return Promise.resolve(rows.map(r => r.path));
     }
 
+    getRecordField(path: string, field: string): Promise<unknown | undefined> {
+        const row = this.db.prepare('SELECT value FROM records WHERE path = ? AND field = ?')
+            .get(path, field) as { value: string } | undefined;
+        return Promise.resolve(row ? JSON.parse(row.value) : undefined);
+    }
+
+    setRecordField(path: string, field: string, value: unknown): Promise<void> {
+        this.db.prepare(`INSERT INTO records(path, field, value) VALUES (?, ?, ?)
+            ON CONFLICT(path, field) DO UPDATE SET value = excluded.value`)
+            .run(path, field, JSON.stringify(value));
+        return Promise.resolve();
+    }
+
+    deleteRecordField(path: string, field: string): Promise<void> {
+        this.db.prepare('DELETE FROM records WHERE path = ? AND field = ?').run(path, field);
+        return Promise.resolve();
+    }
+
+    listRecordFields(path: string, prefix = ''): Promise<Array<{ field: string; value: unknown }>> {
+        const rows = this.db.prepare(`SELECT field, value FROM records
+            WHERE path = ? AND field LIKE ? ESCAPE '\\' ORDER BY field`)
+            .all(path, `${escapeLike(prefix)}%`) as Array<{ field: string; value: string }>;
+        return Promise.resolve(rows.map(row => ({ field: row.field, value: JSON.parse(row.value) })));
+    }
+
+    clearRecordFields(path: string): Promise<void> {
+        this.db.prepare('DELETE FROM records WHERE path = ?').run(path);
+        return Promise.resolve();
+    }
+
+    begin(): Promise<void> { this.db.exec('BEGIN IMMEDIATE'); return Promise.resolve(); }
+    commit(): Promise<void> { this.db.exec('COMMIT'); return Promise.resolve(); }
+    rollback(): Promise<void> { this.db.exec('ROLLBACK'); return Promise.resolve(); }
+
     // ── health ─────────────────────────────────────────────────
 
     healthCheck(): Promise<{ ok: boolean; error?: string }> {
@@ -102,4 +136,8 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         this.db.close();
         return Promise.resolve();
     }
+}
+
+function escapeLike(value: string): string {
+    return value.replace(/[\\%_]/g, match => `\\${match}`);
 }

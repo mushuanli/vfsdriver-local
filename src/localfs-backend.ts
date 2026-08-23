@@ -18,7 +18,7 @@ import type {
     RecordQueryOptions,
     RecordQueryResult,
     RecordWalkOptions,
-} from '@itookit/stdio';
+} from '@itookit/vfs-core';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
 import type { IFsOps, StatResult } from './fs/fs-ops';
 import { ensureDir, joinPath, hasInternalSegment } from './utils/fs-utils';

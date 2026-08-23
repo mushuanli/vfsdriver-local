@@ -50,7 +50,7 @@ await backend.repair(result);            // 修复元数据不一致
 |---|---|---|---|
 | `vfsdriver-indexeddb` | 浏览器 | IndexedDB | IndexedDB |
 | `vfsdriver-localfs` | Node | SQLite sidecar | 原生文件系统 |
-| `stdio MemoryBackend` | Node/Browser | 内存 | 内存 |
+| `vfs-core MemoryBackend` | Node/Browser | 内存 | 内存 |
 
 ## 编码约定
 

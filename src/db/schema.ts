@@ -5,7 +5,7 @@
  *
  * Only non-derivable metadata is stored. Size/mtime/type come from the filesystem.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const DDL = `
 PRAGMA journal_mode  = WAL;
@@ -15,7 +15,7 @@ PRAGMA cache_size    = -8000;
 PRAGMA busy_timeout  = 5000;
 
 CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER PRIMARY KEY);
-INSERT OR IGNORE INTO _schema_version (version) VALUES (3);
+INSERT OR IGNORE INTO _schema_version (version) VALUES (4);
 
 -- Non-derivable metadata keyed by relative path
 CREATE TABLE IF NOT EXISTS meta_ext (

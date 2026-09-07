@@ -3,7 +3,7 @@
  * v4.1: Path-based IStorageBackend. No ino allocation, no path_ino table.
  *
  * Stores files directly in rootDir. Non-derivable metadata in sidecar SQLite.
- * Internal paths (__config/…) go to sidecarDir/vfs-internal/.
+ * File paths map literally beneath rootDir; metadata stays in the sidecar database.
  */
 
 import type {
@@ -21,7 +21,7 @@ import type {
 } from '@itookit/vfs-core';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
 import type { IFsOps, StatResult } from './fs/fs-ops';
-import { ensureDir, joinPath, hasInternalSegment } from './utils/fs-utils';
+import { ensureDir, joinPath } from './utils/fs-utils';
 
 export interface LocalFSBackendOptions {
     rootDir: string;
@@ -49,21 +49,18 @@ export interface VerifyResult {
 
 export class LocalFSBackend implements IStorageBackend {
     readonly name = 'localfs';
-    readonly recordPaths = 'backend' as const;
     readonly records: IRecordStore;
 
     private db: ISidecarDb | null = null;
     private fsOps!: IFsOps;
     private readonly rootDir: string;
     private readonly sidecarDir: string;
-    private readonly internalDir: string;
     private readonly _createDb: (dbPath: string) => Promise<ISidecarDb>;
     private readonly _createFs: () => IFsOps | Promise<IFsOps>;
 
     constructor(options: LocalFSBackendOptions) {
         this.rootDir = options.rootDir;
         this.sidecarDir = options.sidecarDir;
-        this.internalDir = joinPath(this.sidecarDir, 'vfs-internal');
         this._createDb = options.createDb ?? defaultCreateDb;
         this._createFs = options.createFs ?? defaultCreateFs;
         this.records = new SidecarRecordStore(() => this.requireDb(), db => this.recoverRename(db));
@@ -78,7 +75,6 @@ export class LocalFSBackend implements IStorageBackend {
         this.fsOps = await this._createFs();
         await ensureDir(this.fsOps, this.rootDir);
         await ensureDir(this.fsOps, this.sidecarDir);
-        await ensureDir(this.fsOps, this.internalDir);
 
         const dbPath = joinPath(this.sidecarDir, 'index.db');
         try {
@@ -126,17 +122,7 @@ export class LocalFSBackend implements IStorageBackend {
         this.db = null;
     }
 
-    async prepareRecordPaths(systemMountPath: string): Promise<void> {
-        await this.withDb(async db => {
-            const key = 'record-paths/backend-local-v1';
-            if (await db.getRecordField(RENAME_JOURNAL, key)) return;
-            if (systemMountPath !== '/') {
-                if (!db.migrateRecordPaths) throw new Error('Sidecar lacks record-path migration support');
-                await db.migrateRecordPaths(systemMountPath);
-            }
-            await db.setRecordField(RENAME_JOURNAL, key, true);
-        });
-    }
+
 
     // ══ Structure ════════════════════════════════════════════════
 
@@ -353,8 +339,7 @@ export class LocalFSBackend implements IStorageBackend {
 
         // 1. Check directories exist
         if (!(await this.fsOps.exists(this.rootDir))
-            || !(await this.fsOps.exists(this.sidecarDir))
-            || !(await this.fsOps.exists(this.internalDir))) {
+            || !(await this.fsOps.exists(this.sidecarDir))) {
             result.dirsExist = false;
             result.healthy = false;
             return result;
@@ -447,9 +432,8 @@ export class LocalFSBackend implements IStorageBackend {
     private resolve(rel: string): string {
         const p = rel.startsWith('/') ? rel.slice(1) : rel;
         if (!p) return this.rootDir;
-        return hasInternalSegment(p)
-            ? joinPath(this.internalDir, p)
-            : joinPath(this.rootDir, p);
+        if (/[\\\0]/.test(p) || p.split('/').some(part => !part || part === '.' || part === '..')) throw new Error('Invalid backend path');
+        return joinPath(this.rootDir, p);
     }
 
     private requireDb(): ISidecarDb {

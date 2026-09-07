@@ -7,8 +7,8 @@
 
 import Database from 'better-sqlite3';
 import type { ISidecarDb, MetaExtRow } from './sidecar-interface';
-import { DDL } from './schema';
-import { PATH_DATA_EXISTS, movePathStatements, migrateRecordStatements } from './path-data';
+import { DDL, SCHEMA_VERSION } from './schema';
+import { PATH_DATA_EXISTS, movePathStatements } from './path-data';
 
 export class BetterSqliteSidecarDb implements ISidecarDb {
     private readonly db: Database.Database;
@@ -32,6 +32,11 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         this.db.pragma('foreign_keys = ON');
         this.db.pragma('cache_size = -8000');
         this.db.pragma('busy_timeout = 5000');
+        const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
+        if (tables.length) {
+            const versions = tables.some(table => table.name === '_schema_version') ? this.db.prepare('SELECT version FROM _schema_version').all() as Array<{ version: number }> : [];
+            if (versions.length !== 1 || versions[0].version !== SCHEMA_VERSION) { this.db.close(); throw new Error('Filesystem database version incompatible'); }
+        }
         this.db.exec(DDL);
     }
 
@@ -68,11 +73,7 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         if (this.prepare(PATH_DATA_EXISTS).get(path, path, path, path, path, path)) throw new Error(`Destination has durable data: ${path}`);
     }
 
-    async migrateRecordPaths(prefix: string): Promise<void> {
-        const sql = migrateRecordStatements(prefix);
-        if (this.prepare(sql.conflict).get(...sql.values)) throw new Error('Conflicting legacy and backend-local record paths');
-        this.prepare(sql.update).run(...sql.values);
-    }
+
 
     async movePathData(from: string, to: string): Promise<void> {
         for (const { sql, values } of movePathStatements(from, to)) this.prepare(sql).run(...values);

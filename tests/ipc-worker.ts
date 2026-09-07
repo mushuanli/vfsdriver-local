@@ -24,9 +24,8 @@ async function main() {
     const backend = new LocalFSBackend({ rootDir: `${root}/files`, sidecarDir: `${root}/db`, createFs: () => new CrashFs() });
     const mounted = process.argv[3] === 'module';
     const { manager } = await createVFS({ rootBackend: mounted ? new MemoryBackend() : backend,
-        additionalMounts: mounted ? [{ path: '/module/ipc', backend }] : [], modules: [{ name: 'ipc' }] });
-    await manager.mount('ipc');
-    const fs = manager.getEngine('ipc'); await fs.init();
+        additionalMounts: mounted ? [{ path: '/module/ipc', backend }] : [],});
+    const fs = await manager.openFileSystem('/module/ipc');
     const binding = { fs, rootPath: '/session' };
     const store = new SeqFileKernelStore({ fs, rootPath: '/catalog' }, async () => binding);
     await store.initialize();
@@ -80,11 +79,11 @@ async function main() {
             };
             resources.registerAdapter(adapter);
             if (action === 'cleanup-crash' && args.stage === 'receipt') {
-                const original = fs.meta.seq!.transaction!.bind(fs.meta.seq);
-                fs.meta.seq!.transaction = callback => original(async tx => {
+                const original = backend.records.transaction!.bind(backend.records);
+                backend.records.transaction = callback => original(async tx => {
                     const value = await callback(tx);
-                    const raw = await tx.getEntry('/catalog/resources.seq', `managed/cleanup/${encodeURIComponent(args.operation.id)}`);
-                    if (raw && JSON.parse(raw).status === 'succeeded') {
+                    const raw = await tx.getRecordField(`${mounted ? '' : '/module/ipc'}/catalog/resources.seq`, `__vfs_seq__:managed/cleanup/${encodeURIComponent(args.operation.id)}`);
+                    if (raw && JSON.parse(String(raw)).status === 'succeeded') {
                         process.send!({ crashpoint: true });
                         await new Promise(() => {});
                     }

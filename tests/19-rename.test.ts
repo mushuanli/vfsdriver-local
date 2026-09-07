@@ -16,19 +16,18 @@ beforeEach(async () => {
 });
 afterEach(async () => { await backend.close(); await rm(root, { recursive: true, force: true }); });
 
-describe('recoverable namespace migration', () => {
-    it('migrates legacy mounted records and keeps SeqFile values accessible after rename', async () => {
+describe('recoverable filesystem rename', () => {
+    it('keeps backend-local records accessible through a mount after rename', async () => {
         await backend.write('/old/data.seq', new Uint8Array());
-        await db.setRecordField('/module/local/old/data.seq', '__vfs_seq__:state', 'legacy');
+        await db.setRecordField('/old/data.seq', '__vfs_seq__:state', 'original');
         const { manager } = await createVFS({ rootBackend: new MemoryBackend(),
-            additionalMounts: [{ path: '/module/local', backend }], modules: [{ name: 'local' }] });
+            additionalMounts: [{ path: '/workspace', backend }],});
         try {
-            const fs = manager.getEngine('local'); await fs.init();
-            expect(await fs.meta.seq!.getEntry('/old/data.seq', 'state')).toBe('legacy');
-            expect(await db.getRecordField('/module/local/old/data.seq', '__vfs_seq__:state')).toBeUndefined();
+            const fs = await manager.openFileSystem('/workspace');
+            expect(await fs.meta.seq!.getEntry('/old/data.seq', 'state')).toBe('original');
             await fs.meta.seq!.transaction!(tx => tx.setEntry('/old/data.seq', 'next', 'new'));
             await fs.driver.rename('/old', 'new');
-            expect(await fs.meta.seq!.getEntry('/new/data.seq', 'state')).toBe('legacy');
+            expect(await fs.meta.seq!.getEntry('/new/data.seq', 'state')).toBe('original');
             expect(await fs.meta.seq!.getEntry('/new/data.seq', 'next')).toBe('new');
             expect(await db.getRecordField('/new/data.seq', '__vfs_seq__:next')).toBe('new');
             await fs.driver.createFile({ name: 'other.seq', parentPath: null, type: 'seqfile' });
@@ -36,20 +35,6 @@ describe('recoverable namespace migration', () => {
             await fs.driver.move(['/other.seq'], '/new');
             expect(await fs.meta.seq!.getEntry('/new/other.seq', 'value')).toBe('other');
         } finally { await manager.dispose(); }
-    });
-    it('rejects conflicting record namespaces without modifying either copy', async () => {
-        await db.setRecordField('/module/local/data.seq', 'old', 'legacy');
-        await db.setRecordField('/data.seq', 'new', 'current');
-        await expect(backend.prepareRecordPaths('/module/local')).rejects.toThrow('Conflicting legacy');
-        expect(await db.getRecordField('/module/local/data.seq', 'old')).toBe('legacy');
-        expect(await db.getRecordField('/data.seq', 'new')).toBe('current');
-    });
-    it('does not reinterpret local paths when an upgraded backend is remounted', async () => {
-        await backend.prepareRecordPaths('/module/first');
-        await db.setRecordField('/module/second/data.seq', 'value', 'local');
-        await backend.prepareRecordPaths('/module/second');
-        expect(await db.getRecordField('/module/second/data.seq', 'value')).toBe('local');
-        expect(await db.getRecordField('/data.seq', 'value')).toBeUndefined();
     });
     it('moves every descendant record, metadata and tag while preserving prefix siblings', async () => {
         await backend.write('/a_%/deep/data.seq', new Uint8Array());

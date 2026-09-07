@@ -15,13 +15,3 @@ export function movePathStatements(from: string, to: string): Array<{ sql: strin
 }
 
 export const PATH_DATA_EXISTS = `SELECT path FROM meta_ext WHERE ${PATH_SUBTREE} UNION ALL SELECT path FROM records WHERE ${PATH_SUBTREE} LIMIT 1`;
-
-export function migrateRecordStatements(prefix: string) {
-    const local = "CASE WHEN source.path = ? THEN '/' ELSE substr(source.path, length(?) + 1) END";
-    const source = "(source.path = ? OR substr(source.path, 1, length(?) + 1) = ? || '/')";
-    return {
-        conflict: `SELECT source.path FROM records source JOIN records dest ON dest.path = ${local} WHERE ${source} LIMIT 1`,
-        values: [prefix, prefix, prefix, prefix, prefix],
-        update: `UPDATE records SET path = CASE WHEN path = ? THEN '/' ELSE substr(path, length(?) + 1) END WHERE ${PATH_SUBTREE}`,
-    };
-}

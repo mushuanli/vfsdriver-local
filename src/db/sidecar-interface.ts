@@ -21,8 +21,6 @@ export interface ISidecarDb {
 
     /** Move metadata, tag indexes and records for an entire subtree, inside a transaction. */
     movePathData?(fromPath: string, toPath: string): Promise<void>;
-    /** Convert legacy mounted-system record paths to backend-local paths. */
-    migrateRecordPaths?(systemMountPath: string): Promise<void>;
     /** Refuse to merge an existing destination's durable data. */
     assertPathDataVacant?(path: string): Promise<void>;
 

@@ -19,6 +19,13 @@ export interface ISidecarDb {
     upsertMetaExt(row: MetaExtRow): Promise<void>;
     deleteMetaExt(path: string): Promise<void>;
 
+    /** Move metadata, tag indexes and records for an entire subtree, inside a transaction. */
+    movePathData?(fromPath: string, toPath: string): Promise<void>;
+    /** Convert legacy mounted-system record paths to backend-local paths. */
+    migrateRecordPaths?(systemMountPath: string): Promise<void>;
+    /** Refuse to merge an existing destination's durable data. */
+    assertPathDataVacant?(path: string): Promise<void>;
+
     // ── tags ──
     syncTags(path: string, tags: string[] | undefined): Promise<void>;
     getAllDistinctTags(): Promise<string[]>;
@@ -30,6 +37,9 @@ export interface ISidecarDb {
     deleteRecordField(path: string, field: string): Promise<void>;
     listRecordFields(path: string, prefix?: string): Promise<Array<{ field: string; value: unknown }>>;
     clearRecordFields(path: string): Promise<void>;
+
+    /** Supply a connection-bound handle for every operation in the transaction. */
+    transaction?<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T>;
 
     begin(): Promise<void>;
     commit(): Promise<void>;

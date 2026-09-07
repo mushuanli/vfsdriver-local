@@ -19,3 +19,5 @@ export {
     ensureDir, unlinkSafe, cleanOrphanedStaging,
     joinPath, basenamePath, dirnamePath,
 } from './utils/fs-utils';
+
+export { PATH_DATA_EXISTS, movePathStatements, migrateRecordStatements } from './db/path-data';

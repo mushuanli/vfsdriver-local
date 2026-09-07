@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,13 +8,15 @@ import type { ISidecarDb, MetaExtRow } from '../src/db/sidecar-interface';
 describe('LocalFS transactional records', () => {
     let root: string;
     let backend: LocalFSBackend;
+    let sidecar: ISidecarDb;
 
     beforeEach(async () => {
         root = await mkdtemp(join(tmpdir(), 'itookit-records-'));
+        sidecar = new FakeSidecarDb();
         backend = new LocalFSBackend({
             rootDir: join(root, 'files'),
             sidecarDir: join(root, 'sidecar'),
-            createDb: async () => new FakeSidecarDb(),
+            createDb: async () => sidecar,
         });
         await backend.init();
     });
@@ -39,6 +41,33 @@ describe('LocalFS transactional records', () => {
             throw new Error('rollback');
         })).rejects.toThrow('rollback');
         expect(await backend.records.getRecordField('/one.seq', 'version')).toBeUndefined();
+    });
+
+    it('uses the supplied connection for reads, writes and replacing all fields', async () => {
+        const scoped = new FakeSidecarDb();
+        sidecar.transaction = async operation => operation(scoped);
+        await sidecar.setRecordField('/one.seq', 'outside', 'untouched');
+        await scoped.setRecordField('/one.seq', 'old', 'remove');
+        await backend.records.transaction!(async tx => {
+            expect(await tx.getRecordField('/one.seq', 'old')).toBe('remove');
+            await tx.setRecordField('/one.seq', 'new', 'ready');
+        });
+        expect(await scoped.getRecordField('/one.seq', 'new')).toBe('ready');
+        await backend.records.setAllRecordFields('/one.seq', { replacement: 'done' });
+        expect(await scoped.listRecordFields('/one.seq')).toEqual([{ field: 'replacement', value: 'done' }]);
+        expect(await sidecar.listRecordFields('/one.seq')).toEqual([{ field: 'outside', value: 'untouched' }]);
+    });
+
+    it('preserves both errors and permits another transaction after rollback fails', async () => {
+        const original = new Error('commit failed');
+        const rollback = new Error('rollback failed');
+        vi.spyOn(sidecar, 'commit').mockRejectedValueOnce(original);
+        vi.spyOn(sidecar, 'rollback').mockRejectedValueOnce(rollback);
+        await expect(backend.records.transaction!(async () => undefined)).rejects.toMatchObject({
+            cause: original, errors: [original, rollback],
+        });
+        await backend.records.transaction!(async tx => { await tx.setRecordField('/one.seq', 'next', true); });
+        expect(await sidecar.getRecordField('/one.seq', 'next')).toBe(true);
     });
 });
 

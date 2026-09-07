@@ -49,6 +49,7 @@ export interface VerifyResult {
 
 export class LocalFSBackend implements IStorageBackend {
     readonly name = 'localfs';
+    readonly recordPaths = 'backend' as const;
     readonly records: IRecordStore;
 
     private db: ISidecarDb | null = null;
@@ -65,7 +66,7 @@ export class LocalFSBackend implements IStorageBackend {
         this.internalDir = joinPath(this.sidecarDir, 'vfs-internal');
         this._createDb = options.createDb ?? defaultCreateDb;
         this._createFs = options.createFs ?? defaultCreateFs;
-        this.records = new SidecarRecordStore(() => this.requireDb());
+        this.records = new SidecarRecordStore(() => this.requireDb(), db => this.recoverRename(db));
     }
 
     get dbFilePath(): string { return joinPath(this.sidecarDir, 'index.db'); }
@@ -112,6 +113,11 @@ export class LocalFSBackend implements IStorageBackend {
                 throw err; // DB doesn't exist and creation failed — rethrow
             }
         }
+        await this.withDb(async () => undefined);
+    }
+
+    private withDb<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
+        return (this.records as SidecarRecordStore).withDb(operation);
     }
 
     async close(): Promise<void> {
@@ -120,14 +126,26 @@ export class LocalFSBackend implements IStorageBackend {
         this.db = null;
     }
 
+    async prepareRecordPaths(systemMountPath: string): Promise<void> {
+        await this.withDb(async db => {
+            const key = 'record-paths/backend-local-v1';
+            if (await db.getRecordField(RENAME_JOURNAL, key)) return;
+            if (systemMountPath !== '/') {
+                if (!db.migrateRecordPaths) throw new Error('Sidecar lacks record-path migration support');
+                await db.migrateRecordPaths(systemMountPath);
+            }
+            await db.setRecordField(RENAME_JOURNAL, key, true);
+        });
+    }
+
     // ══ Structure ════════════════════════════════════════════════
 
     async stat(path: string): Promise<FSNode | null> {
-        const realPath = this.resolve(path);
-        const stat = await this.fsOps.stat(realPath);
-        if (!stat) return null;
-        const ext = this.db ? await this.db.getMetaExt(path) : null;
-        return toFSNode(path, stat, ext);
+        return this.withDb(async db => {
+            const stat = await this.fsOps.stat(this.resolve(path));
+            if (!stat) return null;
+            return toFSNode(path, stat, await db.getMetaExt(path));
+        });
     }
 
     async list(dirPath: string): Promise<FSNode[]> {
@@ -189,23 +207,55 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     async rename(fromPath: string, toPath: string): Promise<void> {
-        const oldPath = this.resolve(fromPath);
-        const newPath = this.resolve(toPath);
-        await this.fsOps.rename(oldPath, newPath);
-
-        // Update sidecar metadata path
-        if (this.db) {
-            try {
-                const ext = await this.db.getMetaExt(fromPath);
-                if (ext) {
-                    await this.db.deleteMetaExt(fromPath);
-                    await this.db.upsertMetaExt({ ...ext, path: toPath });
-                }
-            } catch (e) {
-                console.error(`[LocalFS] rename metadata update failed from=${fromPath} to=${toPath}`, e);
-                throw e;
-            }
+        if (fromPath === toPath) return;
+        for (const path of [fromPath, toPath]) {
+            if (!path.startsWith('/') || path === '/' || path.split('/').slice(1).some(part => !part || part === '.' || part === '..')) throw new Error('Rename requires canonical non-root paths');
         }
+        if (toPath.startsWith(`${fromPath}/`) || fromPath.startsWith(`${toPath}/`)) throw new Error('Cannot rename overlapping subtrees');
+        // The committed intent survives a crash between filesystem rename and SQL commit.
+        const operationId = await this.withDb(async db => {
+            if (!db.movePathData || !db.assertPathDataVacant) throw new Error('Sidecar lacks recoverable rename support');
+            if (!(await this.fsOps.exists(this.resolve(fromPath)))) throw new Error(`Rename source missing: ${fromPath}`);
+            if (await this.fsOps.exists(this.resolve(toPath))) throw new Error(`Rename destination exists: ${toPath}`);
+            await db.assertPathDataVacant(toPath);
+            const id = Number(await db.getRecordField(RENAME_JOURNAL, 'next-rename') ?? 0) + 1;
+            if (!Number.isSafeInteger(id)) throw new Error('Rename sequence exhausted');
+            await db.setRecordField(RENAME_JOURNAL, 'next-rename', id);
+            await db.setRecordField(RENAME_JOURNAL, 'intent', { id, fromPath, toPath });
+            return id;
+        });
+        // Another process can help either rename; each caller observes its own receipt.
+        const result = await this.withDb(async db => {
+            const key = `rename-result/${operationId}`;
+            const receipt = await db.getRecordField(RENAME_JOURNAL, key) as { error?: string } | undefined;
+            if (!receipt) throw new Error('Rename receipt missing');
+            await db.deleteRecordField(RENAME_JOURNAL, key);
+            return receipt;
+        });
+        if (result.error) throw new Error(result.error);
+    }
+
+    private async recoverRename(db: ISidecarDb): Promise<void> {
+        const intent = await db.getRecordField(RENAME_JOURNAL, 'intent') as { id: number; fromPath: string; toPath: string } | undefined;
+        if (!intent) return;
+        if (!db.movePathData) throw new Error('Sidecar lacks recoverable rename support');
+        const from = this.resolve(intent.fromPath), to = this.resolve(intent.toPath);
+        const sourceExists = await this.fsOps.exists(from), targetExists = await this.fsOps.exists(to);
+        if (sourceExists && !targetExists) {
+            try { await this.fsOps.rename(from, to); }
+            catch (error) {
+                if (await this.fsOps.exists(from) && !(await this.fsOps.exists(to))) {
+                    // No filesystem change: durably abandon the intent before reporting failure.
+                    await db.setRecordField(RENAME_JOURNAL, `rename-result/${intent.id}`, { error: error instanceof Error ? error.message : String(error) });
+                    await db.deleteRecordField(RENAME_JOURNAL, 'intent');
+                    return;
+                }
+                throw error;
+            }
+        } else if (sourceExists || !targetExists) throw new Error('Rename recovery conflict: filesystem was modified outside VFS');
+        await db.movePathData(intent.fromPath, intent.toPath);
+        await db.setRecordField(RENAME_JOURNAL, `rename-result/${intent.id}`, { completed: true });
+        await db.deleteRecordField(RENAME_JOURNAL, 'intent');
     }
 
     // ══ Content ══════════════════════════════════════════════════
@@ -237,17 +287,20 @@ export class LocalFSBackend implements IStorageBackend {
     // ══ Metadata ═════════════════════════════════════════════════
 
     async updateMetadata(path: string, metadata: Record<string, unknown>): Promise<void> {
-        const realPath = this.resolve(path);
-        if (!(await this.fsOps.exists(realPath))) return;
-        const existing = this.db ? await this.db.getMetaExt(path) : null;
-        const merged = existing?.metadata ? { ...JSON.parse(existing.metadata), ...metadata } : metadata;
-        await this._upsertMeta(path, { metadata: JSON.stringify(merged) }, existing);
+        await this.withDb(async db => {
+            if (!(await this.fsOps.exists(this.resolve(path)))) return;
+            const existing = await db.getMetaExt(path);
+            const merged = existing?.metadata ? { ...JSON.parse(existing.metadata), ...metadata } : metadata;
+            await this._upsertMeta(db, path, { metadata: JSON.stringify(merged) }, existing);
+        });
     }
 
     async setTags(path: string, tags: string[]): Promise<void> {
         try {
-            await this._upsertMeta(path, { tags: JSON.stringify(tags) });
-            if (this.db) await this.db.syncTags(path, tags);
+            await this.withDb(async db => {
+                await this._upsertMeta(db, path, { tags: JSON.stringify(tags) });
+                await db.syncTags(path, tags);
+            });
         } catch (e) {
             console.error(`[LocalFS] setTags failed path=${path} tags=${JSON.stringify(tags)}`, e);
             throw e;
@@ -255,16 +308,16 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     async getAllTags(): Promise<string[]> {
-        return this.db ? this.db.getAllDistinctTags() : [];
+        return this.withDb(db => db.getAllDistinctTags());
     }
 
     private async _upsertMeta(
+        db: ISidecarDb,
         path: string,
         partial: Partial<MetaExtRow>,
         existing?: MetaExtRow | null,
     ): Promise<void> {
-        if (!this.db) return;
-        const prev = existing ?? await this.db.getMetaExt(path);
+        const prev = existing ?? await db.getMetaExt(path);
         const row: MetaExtRow = {
             path,
             icon: partial.icon !== undefined ? partial.icon : (prev?.icon ?? null),
@@ -274,7 +327,7 @@ export class LocalFSBackend implements IStorageBackend {
             metadata: partial.metadata !== undefined ? partial.metadata : (prev?.metadata ?? null),
             extra: partial.extra ?? prev?.extra ?? null,
         };
-        await this.db.upsertMetaExt(row);
+        await db.upsertMetaExt(row);
     }
 
     // ══ Transaction ══════════════════════════════════════════════
@@ -405,27 +458,39 @@ export class LocalFSBackend implements IStorageBackend {
     }
 }
 
+const RENAME_JOURNAL = '/__vfs_namespace_journal__';
+
 class SidecarRecordStore implements IRecordStore {
     private tail: Promise<void> = Promise.resolve();
 
-    constructor(private readonly db: () => ISidecarDb) {}
+    constructor(private readonly db: () => ISidecarDb,
+        private readonly beforeTransaction?: (db: ISidecarDb) => Promise<void>,
+        private readonly scoped = false) {}
 
     getRecordField(path: string, field: string): Promise<RecordValue | undefined> {
+        if (!this.scoped) return this.withDb(db => db.getRecordField(path, field)) as Promise<RecordValue | undefined>;
         return this.db().getRecordField(path, field) as Promise<RecordValue | undefined>;
     }
     setRecordField(path: string, field: string, value: RecordValue): Promise<void> {
+        if (!this.scoped) return this.withDb(db => db.setRecordField(path, field, value));
         return this.db().setRecordField(path, field, value);
     }
     deleteRecordField(path: string, field: string): Promise<void> {
+        if (!this.scoped) return this.withDb(db => db.deleteRecordField(path, field));
         return this.db().deleteRecordField(path, field);
     }
     async setAllRecordFields(path: string, fields: Record<string, RecordValue>): Promise<void> {
-        await this.transaction(async tx => {
-            await this.db().clearRecordFields(path);
+        await this.runTransaction(async tx => {
+            await tx.clearRecordFields(path);
             for (const [field, value] of Object.entries(fields)) await tx.setRecordField(path, field, value);
         });
     }
-    clearRecordFields(path: string): Promise<void> { return this.db().clearRecordFields(path); }
+    clearRecordFields(path: string): Promise<void> {
+        return this.scoped ? this.db().clearRecordFields(path) : this.withDb(db => db.clearRecordFields(path));
+    }
+    private rows(path: string, prefix?: string) {
+        return this.scoped ? this.db().listRecordFields(path, prefix) : this.withDb(db => db.listRecordFields(path, prefix));
+    }
     async createRecordIndex(): Promise<void> {}
     async deleteRecordIndex(): Promise<void> {}
     async queryRecordFields(
@@ -433,7 +498,7 @@ class SidecarRecordStore implements IRecordStore {
         query: RecordQuery,
         options?: RecordQueryOptions,
     ): Promise<RecordQueryResult[]> {
-        const rows = await this.db().listRecordFields(path, query.field);
+        const rows = await this.rows(path, query.field);
         const matched = rows.filter(row => row.field === query.field && recordMatches(row.value as RecordValue, query));
         const offset = options?.offset ?? 0;
         return matched.slice(offset, offset + (options?.limit ?? matched.length)) as RecordQueryResult[];
@@ -443,7 +508,7 @@ class SidecarRecordStore implements IRecordStore {
         callback: (field: string, value: RecordValue) => boolean | Promise<boolean>,
         options?: RecordWalkOptions,
     ): Promise<{ total: number; processed: number }> {
-        const rows = await this.db().listRecordFields(path, options?.prefix);
+        const rows = await this.rows(path, options?.prefix);
         let processed = 0;
         const limit = options?.limit ?? Number.POSITIVE_INFINITY;
         for (const row of rows.slice(options?.offset ?? 0)) {
@@ -466,17 +531,34 @@ class SidecarRecordStore implements IRecordStore {
         return processed;
     }
     transaction<T>(operation: (tx: IRecordTransaction) => Promise<T>): Promise<T> {
+        return this.runTransaction(operation);
+    }
+    private runTransaction<T>(operation: (tx: SidecarRecordStore) => Promise<T>): Promise<T> {
+        if (this.scoped) return operation(this);
+        return this.withDb(db => operation(new SidecarRecordStore(() => db, undefined, true)));
+    }
+    withDb<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
         const run = async (): Promise<T> => {
             const db = this.db();
-            await db.begin();
-            try {
-                const result = await operation(this);
-                await db.commit();
-                return result;
-            } catch (error) {
-                await db.rollback();
-                throw error;
+            const execute = async (scopedDb: ISidecarDb): Promise<T> => {
+                await this.beforeTransaction?.(scopedDb);
+                return operation(scopedDb);
+            };
+            let result: T;
+            if (db.transaction) result = await db.transaction(execute);
+            else {
+                await db.begin();
+                try {
+                    result = await execute(db);
+                    await db.commit();
+                } catch (error) {
+                    try { await db.rollback(); } catch (rollbackError) {
+                        throw new AggregateError([error, rollbackError], 'Sidecar transaction failed and rollback failed', { cause: error });
+                    }
+                    throw error;
+                }
             }
+            return result;
         };
         const result = this.tail.then(run, run);
         this.tail = result.then(() => undefined, () => undefined);

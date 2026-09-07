@@ -8,9 +8,22 @@
 import Database from 'better-sqlite3';
 import type { ISidecarDb, MetaExtRow } from './sidecar-interface';
 import { DDL } from './schema';
+import { PATH_DATA_EXISTS, movePathStatements, migrateRecordStatements } from './path-data';
 
 export class BetterSqliteSidecarDb implements ISidecarDb {
     private readonly db: Database.Database;
+    // SQL here is a fixed set of parameterized templates. Retain prepared statements
+    // for the connection lifetime instead of churning native objects on every record read.
+    private readonly statements = new Map<string, Database.Statement>();
+
+    private prepare(sql: string): Database.Statement {
+        let statement = this.statements.get(sql);
+        if (!statement) {
+            statement = this.db.prepare(sql);
+            this.statements.set(sql, statement);
+        }
+        return statement;
+    }
 
     constructor(dbPath: string) {
         this.db = new Database(dbPath);
@@ -25,13 +38,13 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     // ── meta_ext ─────────────────────────────────────────────────
 
     getMetaExt(path: string): Promise<MetaExtRow | null> {
-        const row = this.db.prepare('SELECT * FROM meta_ext WHERE path = ?').get(path) as MetaExtRow | undefined;
+        const row = this.prepare('SELECT * FROM meta_ext WHERE path = ?').get(path) as MetaExtRow | undefined;
         return Promise.resolve(row ?? null);
     }
 
     upsertMetaExt(row: MetaExtRow): Promise<void> {
         try {
-            this.db.prepare(`
+            this.prepare(`
                 INSERT INTO meta_ext (path, icon, device_handler, is_asset_dir, tags, metadata, extra)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
@@ -47,18 +60,32 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     }
 
     deleteMetaExt(path: string): Promise<void> {
-        this.db.prepare('DELETE FROM meta_ext WHERE path = ?').run(path);
+        this.prepare('DELETE FROM meta_ext WHERE path = ?').run(path);
         return Promise.resolve();
+    }
+
+    async assertPathDataVacant(path: string): Promise<void> {
+        if (this.prepare(PATH_DATA_EXISTS).get(path, path, path, path, path, path)) throw new Error(`Destination has durable data: ${path}`);
+    }
+
+    async migrateRecordPaths(prefix: string): Promise<void> {
+        const sql = migrateRecordStatements(prefix);
+        if (this.prepare(sql.conflict).get(...sql.values)) throw new Error('Conflicting legacy and backend-local record paths');
+        this.prepare(sql.update).run(...sql.values);
+    }
+
+    async movePathData(from: string, to: string): Promise<void> {
+        for (const { sql, values } of movePathStatements(from, to)) this.prepare(sql).run(...values);
     }
 
     // ── tags ────────────────────────────────────────────────────
 
     syncTags(path: string, tags: string[] | undefined): Promise<void> {
-        const del = this.db.prepare('DELETE FROM meta_tags WHERE path = ?');
-        const ins = this.db.prepare('INSERT OR IGNORE INTO meta_tags (path, tag) VALUES (?, ?)');
+        const del = this.prepare('DELETE FROM meta_tags WHERE path = ?');
+        const ins = this.prepare('INSERT OR IGNORE INTO meta_tags (path, tag) VALUES (?, ?)');
         try {
             // Diagnostic: verify meta_ext row exists before inserting tags
-            const parentExists = this.db.prepare('SELECT 1 FROM meta_ext WHERE path = ?').get(path);
+            const parentExists = this.prepare('SELECT 1 FROM meta_ext WHERE path = ?').get(path);
             if (!parentExists) {
                 console.error(`[LocalFS:DB] syncTags: meta_ext row MISSING for path="${path}" — INSERT will fail FK`);
             }
@@ -75,42 +102,42 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     }
 
     getAllDistinctTags(): Promise<string[]> {
-        const rows = this.db.prepare('SELECT DISTINCT tag FROM meta_tags ORDER BY tag').all() as Array<{ tag: string }>;
+        const rows = this.prepare('SELECT DISTINCT tag FROM meta_tags ORDER BY tag').all() as Array<{ tag: string }>;
         return Promise.resolve(rows.map(r => r.tag));
     }
 
     queryByTag(tag: string): Promise<string[]> {
-        const rows = this.db.prepare('SELECT path FROM meta_tags WHERE tag = ?').all(tag) as Array<{ path: string }>;
+        const rows = this.prepare('SELECT path FROM meta_tags WHERE tag = ?').all(tag) as Array<{ path: string }>;
         return Promise.resolve(rows.map(r => r.path));
     }
 
     getRecordField(path: string, field: string): Promise<unknown | undefined> {
-        const row = this.db.prepare('SELECT value FROM records WHERE path = ? AND field = ?')
+        const row = this.prepare('SELECT value FROM records WHERE path = ? AND field = ?')
             .get(path, field) as { value: string } | undefined;
         return Promise.resolve(row ? JSON.parse(row.value) : undefined);
     }
 
     setRecordField(path: string, field: string, value: unknown): Promise<void> {
-        this.db.prepare(`INSERT INTO records(path, field, value) VALUES (?, ?, ?)
+        this.prepare(`INSERT INTO records(path, field, value) VALUES (?, ?, ?)
             ON CONFLICT(path, field) DO UPDATE SET value = excluded.value`)
             .run(path, field, JSON.stringify(value));
         return Promise.resolve();
     }
 
     deleteRecordField(path: string, field: string): Promise<void> {
-        this.db.prepare('DELETE FROM records WHERE path = ? AND field = ?').run(path, field);
+        this.prepare('DELETE FROM records WHERE path = ? AND field = ?').run(path, field);
         return Promise.resolve();
     }
 
     listRecordFields(path: string, prefix = ''): Promise<Array<{ field: string; value: unknown }>> {
-        const rows = this.db.prepare(`SELECT field, value FROM records
+        const rows = this.prepare(`SELECT field, value FROM records
             WHERE path = ? AND field LIKE ? ESCAPE '\\' ORDER BY field`)
             .all(path, `${escapeLike(prefix)}%`) as Array<{ field: string; value: string }>;
         return Promise.resolve(rows.map(row => ({ field: row.field, value: JSON.parse(row.value) })));
     }
 
     clearRecordFields(path: string): Promise<void> {
-        this.db.prepare('DELETE FROM records WHERE path = ?').run(path);
+        this.prepare('DELETE FROM records WHERE path = ?').run(path);
         return Promise.resolve();
     }
 
@@ -122,7 +149,7 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
 
     healthCheck(): Promise<{ ok: boolean; error?: string }> {
         try {
-            const row = this.db.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+            const row = this.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
             const ok = row?.integrity_check === 'ok';
             return Promise.resolve(ok ? { ok: true } : { ok: false, error: row?.integrity_check });
         } catch (e) {
@@ -134,6 +161,7 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
 
     close(): Promise<void> {
         this.db.close();
+        this.statements.clear();
         return Promise.resolve();
     }
 }

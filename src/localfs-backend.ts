@@ -163,7 +163,7 @@ export class LocalFSBackend implements IStorageBackend {
     async delete(path: string, options?: { recursive?: boolean }): Promise<void> {
         const realPath = this.resolve(path);
         const stat = await this.fsOps.stat(realPath);
-        if (!stat) return;
+        if (!stat) { await this.withDb(db => db.deleteMetaExt(path)); return; }
 
         if (stat.isDirectory && options?.recursive) {
             await this._deleteDirRecursive(realPath);
@@ -174,9 +174,7 @@ export class LocalFSBackend implements IStorageBackend {
         }
 
         // Clean up sidecar metadata
-        if (this.db) {
-            await this.db.deleteMetaExt(path);
-        }
+        await this.withDb(db => db.deleteMetaExt(path));
     }
 
     private async _deleteDirRecursive(realPath: string): Promise<void> {
@@ -284,13 +282,20 @@ export class LocalFSBackend implements IStorageBackend {
     async setTags(path: string, tags: string[]): Promise<void> {
         try {
             await this.withDb(async db => {
-                await this._upsertMeta(db, path, { tags: JSON.stringify(tags) });
-                await db.syncTags(path, tags);
+                await this._upsertMeta(db, path, { tags: JSON.stringify([...new Set(tags)]) });
+                await db.syncTags(path, [...new Set(tags)]);
             });
         } catch (e) {
             console.error(`[LocalFS] setTags failed path=${path} tags=${JSON.stringify(tags)}`, e);
             throw e;
         }
+    }
+
+    async listTagEntries(): Promise<Array<{ path: string; tag: string }>> {
+        return this.withDb(async db => {
+            if (!db.listTagEntries) throw new Error('Sidecar does not support indexed tag queries');
+            return db.listTagEntries();
+        });
     }
 
     async getAllTags(): Promise<string[]> {

@@ -28,6 +28,7 @@ export interface ISidecarDb {
     syncTags(path: string, tags: string[] | undefined): Promise<void>;
     getAllDistinctTags(): Promise<string[]>;
     queryByTag(tag: string): Promise<string[]>;
+    listTagEntries?(): Promise<Array<{ path: string; tag: string }>>;
 
     // ── SeqFile records ──
     getRecordField(path: string, field: string): Promise<unknown | undefined>;

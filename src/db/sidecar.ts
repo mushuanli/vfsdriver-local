@@ -65,7 +65,7 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     }
 
     deleteMetaExt(path: string): Promise<void> {
-        this.prepare('DELETE FROM meta_ext WHERE path = ?').run(path);
+        this.prepare("DELETE FROM meta_ext WHERE path = ? OR substr(path, 1, length(?) + 1) = ? || '/'").run(path, path, path);
         return Promise.resolve();
     }
 
@@ -105,6 +105,10 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
     getAllDistinctTags(): Promise<string[]> {
         const rows = this.prepare('SELECT DISTINCT tag FROM meta_tags ORDER BY tag').all() as Array<{ tag: string }>;
         return Promise.resolve(rows.map(r => r.tag));
+    }
+
+    async listTagEntries(): Promise<Array<{ path: string; tag: string }>> {
+        return this.db.prepare('SELECT path, tag FROM meta_tags ORDER BY path, tag').all() as Array<{ path: string; tag: string }>;
     }
 
     queryByTag(tag: string): Promise<string[]> {

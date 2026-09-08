@@ -17,6 +17,16 @@ beforeEach(async () => {
 afterEach(async () => { await backend.close(); await rm(root, { recursive: true, force: true }); });
 
 describe('recoverable filesystem rename', () => {
+    it('removes subtree tag associations without affecting prefix siblings', async () => {
+        await backend.write('/folder/file.md', new Uint8Array());
+        await backend.write('/folder-other/keep.md', new Uint8Array());
+        await backend.setTags('/folder/file.md', ['work']);
+        await backend.setTags('/folder-other/keep.md', ['keep']);
+        await backend.rename('/folder', '/moved');
+        expect(await backend.listTagEntries()).toContainEqual({ path: '/moved/file.md', tag: 'work' });
+        await backend.delete('/moved', { recursive: true });
+        expect(await backend.listTagEntries()).toEqual([{ path: '/folder-other/keep.md', tag: 'keep' }]);
+    });
     it('keeps backend-local records accessible through a mount after rename', async () => {
         await backend.write('/old/data.seq', new Uint8Array());
         await db.setRecordField('/old/data.seq', '__vfs_seq__:state', 'original');

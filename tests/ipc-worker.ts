@@ -7,6 +7,7 @@ import { LocalFSBackend } from '../src/localfs-backend';
 import { NodeFsOps } from '../src/fs/node-fs-ops';
 import { Kernel } from '../../durable-kernel/src/application/kernel';
 import { SeqFileKernelStore } from '../../durable-kernel/src/infrastructure/seqfile/store';
+import { addEffect } from '../../durable-kernel/src/application/effect-utils';
 
 let crashOnRename = false;
 class CrashFs extends NodeFsOps {
@@ -40,6 +41,70 @@ async function main() {
         } catch (error) { process.send!({ id: request.id, error: String(error) }); }
     });
     async function execute(action: string, args: any) {
+        if (action === 'cancel-tree-setup') {
+            const parent = await store.createTask(binding, 's', { ...spec, deferStart: true });
+            const child = await store.createTask(binding, 's', { ...spec, parent: parent.id, deferStart: true });
+            const leaf = await store.createTask(binding, 's', { ...spec, parent: child.id });
+            const claim = (await store.claimReady(binding, 'worker', 30_000))!;
+            const next = addEffect({ ...claim.task, state: null, initialized: true, status: 'waiting' as const,
+                currentAttempt: undefined, wait: { type: 'effect' as const, id: 'e' } },
+            { id: 'e', kind: 'external', version: '1', request: null, idempotencyKey: 'e', timeoutMs: 60_000 });
+            await store.commitTask(binding, claim, next, 'task.waiting');
+            const effect = (await store.claimEffect(binding, leaf.id, 'e', 'worker', 30_000))!;
+            return { parent: parent.id, child: child.id, leaf: leaf.id, token: effect.effect.currentAttempt!.leaseToken };
+        }
+        if (action === 'cancel-tree-crash') {
+            await store.cancelTask(binding, args);
+            process.send!({ crashpoint: true });
+            await new Promise(() => {});
+        }
+        if (action === 'late-effect') return store.completeEffect(binding, args.leaf, 'e', args.token, { result: 'late' });
+        if (action === 'recover-effect-cleanup') {
+            const kernel = new Kernel({ catalog: { fs, rootPath: '/catalog' }, pollMs: 0, effectCleanupTimeoutMs: 20 });
+            kernel.registerStorageResolver({ kind: 'local', async resolve() { return binding; } });
+            let calls = 0;
+            if (args.mode !== 'missing') kernel.registerEffect({
+                kind: 'external', version: '1',
+                async execute() { throw new Error('Cancelled effect must not execute'); },
+                ...(args.mode === 'unsupported' ? {} : { async cancel() {
+                    calls++;
+                    if (args.mode === 'failed') throw new Error('External cleanup failed');
+                    if (args.mode === 'hanging') await new Promise(() => {});
+                } }),
+            });
+            await kernel.initialize();
+            try {
+                await kernel.recoverSession('s');
+                return { calls, task: await store.readTask(binding, args.leaf) };
+            } finally { kernel.dispose(); await kernel.waitIdle(); }
+        }
+        if (action === 'cache-setup') {
+            const owner = await store.createTask(binding, 's', { ...spec, deferStart: true });
+            const reader = await store.createTask(binding, 's', { ...spec, deferStart: true });
+            const { handle } = await store.createCache(binding, owner.id, { name: 'once', scope: 'session', usage: 'single-use' });
+            const shared = await store.grantResource(binding, 'reader-handle', handle.id, reader.id, ['read']);
+            await store.publishCache(binding, owner.id, { operationId: 'put', handleId: handle.id,
+                key: 'value', fingerprint: 'v1', value: 'durable-input', expectedGeneration: 1 });
+            return { owner: owner.id, reader: reader.id, handle: handle.id, shared: shared.id };
+        }
+        if (action === 'cache-read' || action === 'cache-crash') {
+            if (action === 'cache-crash' && args.stage === 'before-commit') {
+                const original = backend.records.transaction!.bind(backend.records);
+                backend.records.transaction = callback => original(async tx => {
+                    const value = await callback(tx);
+                    const raw = await tx.getRecordField(`${mounted ? '' : '/module/ipc'}/session/tasks/${args.taskId}/task.seq`, '__vfs_seq__:cache-operation/take');
+                    if (raw) { process.send!({ crashpoint: true }); await new Promise(() => {}); }
+                    return value;
+                });
+            }
+            const receipt = await store.readCache(binding, args.taskId, { operationId: 'take',
+                sources: [{ handleId: args.handleId, key: 'value', fingerprint: 'v1' }] });
+            if (action === 'cache-crash') { process.send!({ crashpoint: true }); await new Promise(() => {}); }
+            return receipt;
+        }
+        if (action === 'cache-invalidate') return store.invalidateCache(binding, args.owner, args.handle, 1);
+        if (action === 'task-event-page') return store.taskEventPage(binding, args);
+        if (action === 'task-list-page') return store.listTaskPage(binding);
         if (action === 'resource-setup') {
             const resource = (await resources.execute({}, { type: 'create', requestId: 'pool', kind: 'pool', name: 'device', capacity: 1,
                 physical: { kind: 'device', version: '1', externalId: 'device' } })).result as any;
@@ -99,6 +164,7 @@ async function main() {
             };
         }
         if (action === 'resume-kernel') {
+            const taskId = typeof args === 'string' ? args : args.taskId;
             const kernel = new Kernel({ catalog: { fs, rootPath: '/catalog' } });
             kernel.registerStorageResolver({ kind: 'local', async resolve() { return binding; } });
             kernel.registerProgram({ manifest: spec.program,
@@ -107,8 +173,8 @@ async function main() {
             });
             await kernel.initialize();
             try {
-                const report = await kernel.recoverSession('s', { takeover: true });
-                const exit = await (await kernel.openTask(args)).wait({ timeoutMs: 2000 });
+                const report = await kernel.recoverSession('s', { takeover: typeof args === 'string' || args.takeover !== false });
+                const exit = await (await kernel.openTask(taskId)).wait({ timeoutMs: 5000 });
                 return { report, exit };
             } finally { kernel.dispose(); await kernel.waitIdle(); }
         }
@@ -131,8 +197,9 @@ async function main() {
         if (action === 'complete') return store.cancelTask(binding, args);
         if (action === 'snapshot') return Promise.all(args.map((id: string) => store.readTask(binding, id)));
         if (action === 'recover') return store.recover(binding);
-        if (action === 'create') return store.createTask(binding, 's', spec);
+        if (action === 'create') return store.createTask(binding, 's', { ...spec, ...(args?.retry ? { retry: args.retry } : {}) });
         if (action === 'claim') return await store.claimReady(binding, String(process.pid), 30_000) ?? null;
+        if (action === 'claim-short') return await store.claimReady(binding, String(process.pid), 2500) ?? null;
         if (action === 'crash-tx') return fs.meta.seq!.transaction!(async tx => {
             await tx.setEntry(`/session/tasks/${args}/task.seq`, 'record', '{"broken":true}');
             await tx.setEntry('/session/graph.seq', 'uncommitted', 'bad');

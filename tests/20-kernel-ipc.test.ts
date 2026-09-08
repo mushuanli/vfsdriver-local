@@ -61,6 +61,51 @@ afterEach(async () => { await Promise.all(children.splice(0).map(kill)); await r
 
 describe.each(['root', 'module'])('kernel over shared LocalFS/SQLite (%s mount) in independent OS processes', mode => {
     beforeEach(() => { mountMode = mode; });
+    it('retains Effect cleanup across missing, unsupported and failed adapters after SIGKILL', async () => {
+        const a = await worker(), ids = await call(a, 'cancel-tree-setup');
+        await crash(a, 'cancel-tree-crash', ids.parent);
+        const b = await worker();
+        for (const mode of ['missing', 'unsupported', 'failed', 'hanging']) {
+            const result = await call(b, 'recover-effect-cleanup', { leaf: ids.leaf, mode });
+            expect(result.task.status).toBe('cancelled');
+            expect(result.task.effects.e.cleanupPending).toBe(true);
+            expect(result.calls).toBe(mode === 'failed' || mode === 'hanging' ? 1 : 0);
+        }
+        await kill(b);
+        const c = await worker();
+        const result = await call(c, 'recover-effect-cleanup', { leaf: ids.leaf, mode: 'success' });
+        expect(result.calls).toBe(1);
+        expect(result.task.status).toBe('cancelled');
+        expect(result.task.effects.e.cleanupPending).toBe(false);
+        await kill(c);
+        const d = await worker();
+        const repeated = await call(d, 'recover-effect-cleanup', { leaf: ids.leaf, mode: 'success' });
+        expect(repeated.calls).toBe(0);
+        expect(repeated.task).toEqual(result.task);
+    });
+    it('recovers a cancelled tree after SIGKILL between parent commit and descendant cleanup', async () => {
+        const a = await worker(), ids = await call(a, 'cancel-tree-setup');
+        await crash(a, 'cancel-tree-crash', ids.parent);
+        const b = await worker();
+        const before = await call(b, 'snapshot', [ids.parent, ids.child, ids.leaf]);
+        expect(before.map((task: any) => task.status)).toEqual(['cancelled', 'created', 'waiting']);
+        expect(before[2].effects.e.status).toBe('leased');
+        expect(before[2].effects.e.currentAttempt.leaseUntil).toBeGreaterThan(Date.now());
+        await expect(call(b, 'late-effect', ids)).rejects.toThrow('Stale effect claim');
+        expect(await call(b, 'snapshot', [ids.parent, ids.child, ids.leaf])).toEqual(before);
+        await call(b, 'recover');
+        const after = await call(b, 'snapshot', [ids.parent, ids.child, ids.leaf]);
+        expect(after.map((task: any) => task.status)).toEqual(['cancelled', 'cancelled', 'cancelled']);
+        expect(after[2].effects.e).toMatchObject({ status: 'cancelled', cleanupPending: true });
+        expect(after[2].effects.e.currentAttempt).toBeUndefined();
+        const page = await call(b, 'task-event-page', ids.leaf);
+        expect(page.items.filter((event: any) => event.type === 'task.cancelled')).toHaveLength(1);
+        await kill(b);
+        const c = await worker();
+        await call(c, 'recover');
+        expect(await call(c, 'snapshot', [ids.parent, ids.child, ids.leaf])).toEqual(after);
+        expect(await call(c, 'task-event-page', ids.leaf)).toEqual(page);
+    });
     it('advances another process\'s waiter and dependant without event delivery or sweep', async () => {
         const a = await worker();
         const ids = await call(a, 'setup');
@@ -94,6 +139,30 @@ describe.each(['root', 'module'])('kernel over shared LocalFS/SQLite (%s mount) 
         const claims = await Promise.all([call(a, 'claim'), call(b, 'claim')]);
         expect(claims.filter(Boolean).map(c => c.task.id)).toEqual([task.id]);
     });
+    it('delivers a single-use cache to only one competing process', async () => {
+        const a = await worker(), setup = await call(a, 'cache-setup'), b = await worker();
+        const owner = { taskId: setup.owner, handleId: setup.handle }, reader = { taskId: setup.reader, handleId: setup.shared };
+        const results = await Promise.all([call(a, 'cache-read', owner), call(b, 'cache-read', reader)]);
+        expect(results.map(result => result.status).sort()).toEqual(['hit', 'miss']);
+        expect(await call(a, 'cache-read', owner)).toEqual(results[0]);
+        expect(await call(b, 'cache-read', reader)).toEqual(results[1]);
+    });
+    it.each(['before-commit', 'after-commit'])('preserves single-use receipt atomicity across SIGKILL %s', async stage => {
+        const a = await worker(), setup = await call(a, 'cache-setup');
+        const owner = { taskId: setup.owner, handleId: setup.handle }, reader = { taskId: setup.reader, handleId: setup.shared };
+        await crash(a, 'cache-crash', { ...owner, stage });
+        const b = await worker();
+        const other = await call(b, 'cache-read', reader);
+        const recovered = await call(b, 'cache-read', owner);
+        expect(other.status).toBe(stage === 'before-commit' ? 'hit' : 'miss');
+        expect(recovered.status).toBe(stage === 'before-commit' ? 'miss' : 'hit');
+        if (stage === 'after-commit') expect(recovered.value).toBe('durable-input');
+        await call(b, 'cache-invalidate', setup);
+        expect(await call(b, 'cache-read', owner)).toEqual(recovered);
+        const page = await call(b, 'task-event-page', setup.owner);
+        expect(page.items.filter((event: any) => event.type === 'cache.read')).toHaveLength(1);
+        expect((await call(b, 'task-list-page')).items.map((task: any) => task.id).sort()).toEqual([setup.owner, setup.reader].sort());
+    });
     it('resumes an unexpired task through Kernel after SIGKILL without periodic polling', async () => {
         const a = await worker();
         const task = await call(a, 'create');
@@ -103,6 +172,16 @@ describe.each(['root', 'module'])('kernel over shared LocalFS/SQLite (%s mount) 
         const b = await worker();
         const result = await call(b, 'resume-kernel', task.id);
         expect(result.report.recoveredTasks).toBe(1);
+        expect(result.exit).toMatchObject({ status: 'succeeded', output: 'recovered' });
+    });
+    it('waits for the dead worker lease deadline and resumes without forced takeover', async () => {
+        const a = await worker();
+        const task = await call(a, 'create', { retry: { maxAttempts: 2 } });
+        await call(a, 'claim-short');
+        await kill(a);
+        const b = await worker();
+        const result = await call(b, 'resume-kernel', { taskId: task.id, takeover: false });
+        expect(result.report.recoveredTasks).toBe(0);
         expect(result.exit).toMatchObject({ status: 'succeeded', output: 'recovered' });
     });
     it.each(['adapter', 'receipt'])('recovers physical cleanup after SIGKILL at %s without overallocating', async stage => {

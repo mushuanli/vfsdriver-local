@@ -107,35 +107,11 @@ export class LocalFSBackend implements IStorageBackend {
         const dbPath = joinPath(this.sidecarDir, 'index.db');
         try {
             this.db = await this.openSidecar(dbPath);
-        } catch (err) {
-            // Check if DB is corrupted and try to recover
-            const dbExists = await this.fsOps.exists(dbPath);
-            if (dbExists) {
-                // Test integrity with a raw connection (no DDL, no foreign_keys)
-                // to avoid creating orphaned WAL files that conflict on retry.
-                let corrupted = true;
-                try {
-                    const { default: Database } = await import('better-sqlite3');
-                    const probe = new Database(dbPath, { readonly: true });
-                    try {
-                        const row = probe.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-                        corrupted = row?.integrity_check !== 'ok';
-                    } finally {
-                        probe.close();
-                    }
-                } catch {
-                    corrupted = true;
-                }
-                if (corrupted) {
-                    await this.fsOps.unlink(dbPath);
-                    await ensureDir(this.fsOps, this.sidecarDir);
-                    this.db = await this.openSidecar(dbPath);
-                } else {
-                    throw err; // DB is healthy but _createDb still failed — rethrow
-                }
-            } else {
-                throw err; // DB doesn't exist and creation failed — rethrow
-            }
+        } catch (error) {
+            if (!await this.fsOps.exists(dbPath) || !await confirmedCorruption(dbPath)) throw error;
+            await this.fsOps.unlink(dbPath);
+            await ensureDir(this.fsOps, this.sidecarDir);
+            this.db = await this.openSidecar(dbPath);
         }
         await this.withDb(async () => undefined);
     }
@@ -144,7 +120,7 @@ export class LocalFSBackend implements IStorageBackend {
         return (this.records as SidecarRecordStore).withDb(operation);
     }
 
-    /** Read-only counterpart of `withDb`: no transaction round trips while the journal is clean. */
+    /** Reads retain the same transactional recovery boundary as writes. */
     private withDbRead<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
         return (this.records as SidecarRecordStore).withDbRead(operation);
     }
@@ -660,6 +636,21 @@ export async function openLocalFSBackend(options: LocalFSBackendOptions): Promis
 async function defaultCreateDb(dbPath: string): Promise<ISidecarDb> {
     const { BetterSqliteSidecarDb } = await import('./db/sidecar');
     return new BetterSqliteSidecarDb(dbPath);
+}
+
+/** Unavailable probes and unknown results never authorize deleting durable data. */
+async function confirmedCorruption(path: string): Promise<boolean> {
+    try {
+        const { default: Database } = await import('better-sqlite3');
+        const probe = new Database(path, { readonly: true });
+        try {
+            const row = probe.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown } | undefined;
+            return typeof row?.integrity_check === 'string' && row.integrity_check.trim().length > 0 && row.integrity_check !== 'ok';
+        } finally { probe.close(); }
+    } catch (error) {
+        const code = (error as { code?: string } | null)?.code;
+        return code === 'SQLITE_CORRUPT' || code === 'SQLITE_NOTADB';
+    }
 }
 
 async function defaultCreateFs(): Promise<IFsOps> {

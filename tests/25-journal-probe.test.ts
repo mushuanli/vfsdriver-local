@@ -177,5 +177,10 @@ describe('rename journal probing', () => {
             reason: expect.objectContaining({ message: 'Invalid batched stat response length' }) });
     });
 
-
+    it('survives concurrent writes to the same path without sharing a temp file', async () => {
+        await Promise.all(Array.from({ length: 24 }, (_, index) => backend.write('/same.bin', new Uint8Array([index]))));
+        expect((await backend.read('/same.bin')).length).toBe(1);
+        const names = (await backend.list('/')).map(node => node.name);
+        expect(names.filter(name => name.startsWith('same.bin'))).toEqual(['same.bin']);
+    });
 });

@@ -5,6 +5,7 @@
 
 import { promises as fs } from 'node:fs';
 import nodePath from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type { IFsOps, StatResult, DirEntry } from './fs-ops';
 
 export class NodeFsOps implements IFsOps {
@@ -20,10 +21,11 @@ export class NodeFsOps implements IFsOps {
 
     async writeFile(p: string, data: ArrayBuffer): Promise<void> {
         await fs.mkdir(nodePath.dirname(p), { recursive: true });
-        // Atomic: write to temp file, then rename (POSIX rename is atomic)
-        const tmp = `${p}.${process.pid}.tmp`;
+        const tmp = `${p}.${randomUUID()}.tmp`;
+        // Exclusive creation prevents overwriting a stale or pre-existing temporary path.
+        const file = await fs.open(tmp, 'wx');
         try {
-            await fs.writeFile(tmp, Buffer.from(data));
+            try { await file.writeFile(Buffer.from(data)); } finally { await file.close(); }
             await fs.rename(tmp, p);
         } catch (err) {
             await fs.unlink(tmp).catch(() => {});

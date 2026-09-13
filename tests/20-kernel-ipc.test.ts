@@ -199,10 +199,11 @@ describe.each(['root', 'module'])('kernel over shared LocalFS/SQLite (%s mount) 
         const replay = await call(b, 'cleanup-recover', setup);
         expect(replay.waiting.result.id).toBe(recovered.waiting.result.id);
     });
-    it('recovers records after SIGKILL between filesystem rename and sidecar migration', async () => {
+    it.each([false, true])('recovers a SIGKILL rename with reader already open: %s', async alreadyOpen => {
         const a = await worker();
+        const existing = alreadyOpen ? await worker() : undefined;
         await crash(a, 'rename-crash');
-        const b = await worker();
+        const b = existing ?? await worker();
         expect(await call(b, 'read-renamed')).toEqual({ value: 'durable' });
     });
 });

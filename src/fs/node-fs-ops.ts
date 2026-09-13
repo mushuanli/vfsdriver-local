@@ -36,14 +36,24 @@ export class NodeFsOps implements IFsOps {
     }
 
     async stat(p: string): Promise<StatResult | null> {
-        const s = await fs.stat(p).catch(() => null);
+        const s = await fs.lstat(p).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+            throw error;
+        });
         if (!s) return null;
         return {
             size:        s.size,
             mtimeMs:     s.mtimeMs,
             birthtimeMs: s.birthtimeMs || 0,
             isDirectory: s.isDirectory(),
+            isSymbolicLink: s.isSymbolicLink(),
+            isFile: s.isFile(),
         };
+    }
+
+    /** Local stats are one syscall each; the batch form only saves per-call overhead. */
+    async statMany(paths: string[]): Promise<Array<StatResult | null>> {
+        return Promise.all(paths.map(path => this.stat(path)));
     }
 
     async readDir(p: string): Promise<DirEntry[]> {

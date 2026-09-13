@@ -19,7 +19,9 @@ import type {
     RecordQueryResult,
     RecordWalkOptions,
 } from '@itookit/vfs-core';
+import { FSError } from '@itookit/vfs-core';
 import type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
+import { SIDECAR_OPERATIONS, countSidecarOperations, type SidecarOperation } from './db/sidecar-stats';
 import type { IFsOps, StatResult } from './fs/fs-ops';
 import { ensureDir, joinPath } from './utils/fs-utils';
 
@@ -57,16 +59,42 @@ export class LocalFSBackend implements IStorageBackend {
     private readonly sidecarDir: string;
     private readonly _createDb: (dbPath: string) => Promise<ISidecarDb>;
     private readonly _createFs: () => IFsOps | Promise<IFsOps>;
+    private readonly sidecarCounts = new Map<string, number>();
+    /** Pending type-only stats for one event-loop tick; flushed as a single `statMany`. */
+    private statTypeBatch?: {
+        paths: string[];
+        resolve: Array<(value: { type: 'file' | 'directory' } | null) => void>;
+        reject: Array<(error: unknown) => void>;
+    };
 
     constructor(options: LocalFSBackendOptions) {
         this.rootDir = options.rootDir;
         this.sidecarDir = options.sidecarDir;
         this._createDb = options.createDb ?? defaultCreateDb;
         this._createFs = options.createFs ?? defaultCreateFs;
-        this.records = new SidecarRecordStore(() => this.requireDb(), db => this.recoverRename(db));
+        this.records = new SidecarRecordStore(() => this.requireDb(), db => this.recoverRename(db), false);
     }
 
     get dbFilePath(): string { return joinPath(this.sidecarDir, 'index.db'); }
+
+    /** Per-operation sidecar call counts, cumulative since open or the last reset. */
+    get sidecarStats(): Readonly<Record<SidecarOperation, number>> {
+        return Object.freeze(Object.fromEntries(
+            SIDECAR_OPERATIONS.map(operation => [operation, this.sidecarCounts.get(operation) ?? 0]),
+        )) as Readonly<Record<SidecarOperation, number>>;
+    }
+
+    /** Clear the sidecar call counters (hosts use deltas, not absolutes). */
+    resetSidecarStats(): void { this.sidecarCounts.clear(); }
+
+    private bumpSidecar(operation: string): void {
+        this.sidecarCounts.set(operation, (this.sidecarCounts.get(operation) ?? 0) + 1);
+    }
+
+    private async openSidecar(dbPath: string): Promise<ISidecarDb> {
+        const db = await this._createDb(dbPath);
+        return countSidecarOperations(db, operation => this.bumpSidecar(operation));
+    }
 
     // ══ Lifecycle ═════════════════════════════════════════════════
 
@@ -78,7 +106,7 @@ export class LocalFSBackend implements IStorageBackend {
 
         const dbPath = joinPath(this.sidecarDir, 'index.db');
         try {
-            this.db = await this._createDb(dbPath);
+            this.db = await this.openSidecar(dbPath);
         } catch (err) {
             // Check if DB is corrupted and try to recover
             const dbExists = await this.fsOps.exists(dbPath);
@@ -101,7 +129,7 @@ export class LocalFSBackend implements IStorageBackend {
                 if (corrupted) {
                     await this.fsOps.unlink(dbPath);
                     await ensureDir(this.fsOps, this.sidecarDir);
-                    this.db = await this._createDb(dbPath);
+                    this.db = await this.openSidecar(dbPath);
                 } else {
                     throw err; // DB is healthy but _createDb still failed — rethrow
                 }
@@ -116,6 +144,11 @@ export class LocalFSBackend implements IStorageBackend {
         return (this.records as SidecarRecordStore).withDb(operation);
     }
 
+    /** Read-only counterpart of `withDb`: no transaction round trips while the journal is clean. */
+    private withDbRead<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
+        return (this.records as SidecarRecordStore).withDbRead(operation);
+    }
+
     async close(): Promise<void> {
         if (!this.db) return;
         await this.db.close();
@@ -127,11 +160,45 @@ export class LocalFSBackend implements IStorageBackend {
     // ══ Structure ════════════════════════════════════════════════
 
     async stat(path: string): Promise<FSNode | null> {
-        return this.withDb(async db => {
+        return this.withDbRead(async db => {
             const stat = await this.fsOps.stat(this.resolve(path));
             if (!stat) return null;
             return toFSNode(path, stat, await db.getMetaExt(path));
         });
+    }
+
+    /**
+     * Type-only stat for capability checks (`FileSystemView.noLinks`): same type source as `stat`,
+     * but skips the sidecar `getMetaExt` round trip. Prefix walks issue their segment checks
+     * concurrently, so they are coalesced here into one host round trip (`fsOps.statMany`).
+     */
+    async statType(path: string): Promise<{ type: 'file' | 'directory' } | null> {
+        const direct = async () => {
+            const stat = await this.fsOps.stat(this.resolve(path));
+            return checkedNodeType(stat);
+        };
+        if (!this.fsOps.statMany) return direct();
+        return new Promise((resolve, reject) => {
+            const batch = (this.statTypeBatch ??= { paths: [], resolve: [], reject: [] });
+            batch.paths.push(path); batch.resolve.push(resolve); batch.reject.push(reject);
+            if (batch.paths.length === 1) queueMicrotask(() => { void this.flushStatTypes(); });
+        });
+    }
+
+    /** Flush the coalesced type-only stats in one `fsOps.statMany` call. */
+    private async flushStatTypes(): Promise<void> {
+        const batch = this.statTypeBatch;
+        this.statTypeBatch = undefined;
+        if (!batch || !this.fsOps.statMany) return;
+        try {
+            const stats = await this.fsOps.statMany(batch.paths.map(path => this.resolve(path)));
+            if (stats.length !== batch.paths.length) throw new Error('Invalid batched stat response length');
+            stats.forEach((stat, index) => {
+                try { batch.resolve[index](checkedNodeType(stat)); } catch (error) { batch.reject[index](error); }
+            });
+        } catch (error) {
+            for (const reject of batch.reject) reject(error);
+        }
     }
 
     async list(dirPath: string): Promise<FSNode[]> {
@@ -220,6 +287,8 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     private async recoverRename(db: ISidecarDb): Promise<void> {
+        // Another process may commit a rename intent after this connection opens.
+        // Probe under the same transaction as the operation; local clean state is insufficient.
         const intent = await db.getRecordField(RENAME_JOURNAL, 'intent') as { id: number; fromPath: string; toPath: string } | undefined;
         if (!intent) return;
         if (!db.movePathData) throw new Error('Sidecar lacks recoverable rename support');
@@ -292,14 +361,14 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     async listTagEntries(): Promise<Array<{ path: string; tag: string }>> {
-        return this.withDb(async db => {
+        return this.withDbRead(async db => {
             if (!db.listTagEntries) throw new Error('Sidecar does not support indexed tag queries');
             return db.listTagEntries();
         });
     }
 
     async getAllTags(): Promise<string[]> {
-        return this.withDb(db => db.getAllDistinctTags());
+        return this.withDbRead(db => db.getAllDistinctTags());
     }
 
     private async _upsertMeta(
@@ -457,7 +526,7 @@ class SidecarRecordStore implements IRecordStore {
         private readonly scoped = false) {}
 
     getRecordField(path: string, field: string): Promise<RecordValue | undefined> {
-        if (!this.scoped) return this.withDb(db => db.getRecordField(path, field)) as Promise<RecordValue | undefined>;
+        if (!this.scoped) return this.withDbRead(db => db.getRecordField(path, field)) as Promise<RecordValue | undefined>;
         return this.db().getRecordField(path, field) as Promise<RecordValue | undefined>;
     }
     setRecordField(path: string, field: string, value: RecordValue): Promise<void> {
@@ -478,7 +547,7 @@ class SidecarRecordStore implements IRecordStore {
         return this.scoped ? this.db().clearRecordFields(path) : this.withDb(db => db.clearRecordFields(path));
     }
     private rows(path: string, prefix?: string) {
-        return this.scoped ? this.db().listRecordFields(path, prefix) : this.withDb(db => db.listRecordFields(path, prefix));
+        return this.scoped ? this.db().listRecordFields(path, prefix) : this.withDbRead(db => db.listRecordFields(path, prefix));
     }
     async createRecordIndex(): Promise<void> {}
     async deleteRecordIndex(): Promise<void> {}
@@ -527,31 +596,40 @@ class SidecarRecordStore implements IRecordStore {
         return this.withDb(db => operation(new SidecarRecordStore(() => db, undefined, true)));
     }
     withDb<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
-        const run = async (): Promise<T> => {
-            const db = this.db();
-            const execute = async (scopedDb: ISidecarDb): Promise<T> => {
-                await this.beforeTransaction?.(scopedDb);
-                return operation(scopedDb);
-            };
-            let result: T;
-            if (db.transaction) result = await db.transaction(execute);
-            else {
-                await db.begin();
-                try {
-                    result = await execute(db);
-                    await db.commit();
-                } catch (error) {
-                    try { await db.rollback(); } catch (rollbackError) {
-                        throw new AggregateError([error, rollbackError], 'Sidecar transaction failed and rollback failed', { cause: error });
-                    }
-                    throw error;
-                }
-            }
-            return result;
-        };
+        return this.serialize(db => this.runInTransaction(db, operation));
+    }
+    /**
+     * Reads share the transaction/recovery boundary with writes: another process may
+     * have moved files without migrating the durable records yet.
+     */
+    withDbRead<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
+        if (this.scoped) return operation(this.db());
+        return this.withDb(operation);
+    }
+    /** Every operation on this store is serialized through one tail so reads and writes stay ordered. */
+    private serialize<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
+        const run = async (): Promise<T> => operation(this.db());
         const result = this.tail.then(run, run);
         this.tail = result.then(() => undefined, () => undefined);
         return result;
+    }
+    private async runInTransaction<T>(db: ISidecarDb, operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
+        const execute = async (scopedDb: ISidecarDb): Promise<T> => {
+            await this.beforeTransaction?.(scopedDb);
+            return operation(scopedDb);
+        };
+        if (db.transaction) return db.transaction(execute);
+        await db.begin();
+        try {
+            const result = await execute(db);
+            await db.commit();
+            return result;
+        } catch (error) {
+            try { await db.rollback(); } catch (rollbackError) {
+                throw new AggregateError([error, rollbackError], 'Sidecar transaction failed and rollback failed', { cause: error });
+            }
+            throw error;
+        }
     }
 }
 
@@ -591,7 +669,16 @@ async function defaultCreateFs(): Promise<IFsOps> {
 
 // ══ FSNode Factory ══════════════════════════════════════════════
 
+function checkedNodeType(stat: StatResult | null): { type: 'file' | 'directory' } | null {
+    if (!stat) return null;
+    if (stat.isSymbolicLink || (!stat.isDirectory && stat.isFile === false)) {
+        throw new FSError('EACCES', 'Links and device nodes require a separate capability');
+    }
+    return { type: stat.isDirectory ? 'directory' : 'file' };
+}
+
 function toFSNode(path: string, stat: StatResult, ext: MetaExtRow | null): FSNode {
+    checkedNodeType(stat);
     const name = path === '/' ? '' : path.split('/').pop()!;
     const parentPath = path === '/' ? null : path.substring(0, path.lastIndexOf('/')) || '/';
     const modifiedAt = stat.mtimeMs;

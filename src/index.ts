@@ -9,6 +9,7 @@ export type { LocalFSBackendOptions, VerifyResult } from './localfs-backend';
 
 // ── Interfaces ──
 export type { ISidecarDb, MetaExtRow } from './db/sidecar-interface';
+export { SIDECAR_OPERATIONS, countSidecarOperations, type SidecarOperation } from './db/sidecar-stats';
 export type { IFsOps, StatResult, DirEntry } from './fs/fs-ops';
 
 // ── Schema ──

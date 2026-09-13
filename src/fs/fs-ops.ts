@@ -16,6 +16,8 @@ export interface StatResult {
     mtimeMs:     number;
     birthtimeMs: number;
     isDirectory: boolean;
+    isSymbolicLink?: boolean;
+    isFile?: boolean;
 }
 
 export interface DirEntry {
@@ -39,6 +41,12 @@ export interface IFsOps {
 
     /** Returns null when the path does not exist. */
     stat(path: string): Promise<StatResult | null>;
+
+    /**
+     * Batch stat preserving input order. A host whose `stat` is one IPC round trip should override
+     * this so a coalesced path-prefix walk costs one round trip instead of one per segment.
+     */
+    statMany?(paths: string[]): Promise<Array<StatResult | null>>;
 
     /** Returns an empty array when the directory does not exist. */
     readDir(path: string): Promise<DirEntry[]>;

@@ -34,7 +34,8 @@
         "dev": "tsup --watch",
         "test": "vitest run",
         "test:watch": "vitest",
-        "prepublishOnly": "pnpm build"
+        "prepublishOnly": "pnpm build",
+        "typecheck": "tsc --noEmit"
     },
     "keywords": [
         "itookit",

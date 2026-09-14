@@ -133,6 +133,22 @@ describe.each(['root', 'module'])('kernel over shared LocalFS/SQLite (%s mount) 
         await call(b, 'complete', ids.target);
         expect((await call(b, 'snapshot', [ids.waiter, ids.dependent])).map((r: any) => r.status)).toEqual(['ready', 'ready']);
     });
+    it('retains consumed message receipts across SIGKILL and concurrent local Session GC', async () => {
+        const a = await worker(), sent = await call(a, 'message-setup');
+        await crash(a, 'message-consume-crash', sent);
+        const b = await worker(), c = await worker();
+        expect(await Promise.all([call(b, 'message-prune', 'source'), call(c, 'message-prune', 'target')]))
+            .toEqual([{ outbox: 0, inbox: 0 }, { outbox: 0, inbox: 0 }]);
+        expect(await call(c, 'message-redeliver', sent)).toBe(false);
+        expect(await call(b, 'message-settle', sent)).toEqual([]);
+        expect(await Promise.all([call(b, 'message-prune', 'source'), call(c, 'message-prune', 'target')]))
+            .toEqual([{ outbox: 1, inbox: 0 }, { outbox: 0, inbox: 1 }]);
+        await kill(b); await kill(c);
+        const reopened = await worker();
+        expect(await call(reopened, 'message-prune', 'source')).toEqual({ outbox: 0, inbox: 0 });
+        expect(await call(reopened, 'message-prune', 'target')).toEqual({ outbox: 0, inbox: 0 });
+    });
+
     it('grants a ready task to only one competing process', async () => {
         const a = await worker(), b = await worker();
         const task = await call(a, 'create');

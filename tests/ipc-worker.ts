@@ -41,6 +41,37 @@ async function main() {
         } catch (error) { process.send!({ id: request.id, error: String(error) }); }
     });
     async function execute(action: string, args: any) {
+        if (action.startsWith('message-')) {
+            const target = { fs, rootPath: '/target' };
+            if (action === 'message-setup') {
+                const targetStore = new SeqFileKernelStore({ fs, rootPath: '/catalog' }, async () => target);
+                await targetStore.createSession('target', { kind: 'local', locator: '/target' });
+                const sender = await store.createTask(binding, 's', { ...spec, deferStart: true });
+                const receiver = await store.createTask(target, 'target', spec);
+                const init = (await store.claimReady(target, 'receiver', 10_000))!;
+                await store.commitTask(target, init, { ...init.task, initialized: true, state: null, status: 'waiting',
+                    currentAttempt: undefined, wait: { type: 'message', topic: 'work' } }, 'task.waiting');
+                return store.sendTaskMessage(binding, sender.id, { idempotencyKey: 'once', targetSessionId: 'target',
+                    targetTaskId: receiver.id, topic: 'work', payload: 'durable' });
+            }
+            if (action === 'message-consume-crash') {
+                await store.deliverMessage(target, args);
+                const claim = (await store.claimReady(target, 'receiver', 10_000))!;
+                await store.commitTask(target, claim, { ...claim.task, pendingEvents: [], status: 'waiting',
+                    currentAttempt: undefined, wait: { type: 'signal' } }, 'task.waiting');
+                process.send!({ crashpoint: true }); await new Promise(() => {});
+            }
+            if (action === 'message-prune') return store.pruneMessages(args === 'target' ? target : binding, Date.now() + 1);
+            if (action === 'message-redeliver') return store.deliverMessage(target, args);
+            if (action === 'message-settle') {
+                await store.markMessageDelivered(binding, args.id, await store.messageReceipt(target, args.id));
+                const settled = (await store.outbox(binding))[0];
+                await store.acknowledgeMessageSettlement(target, settled, 'inbox');
+                await store.acknowledgeMessageSettlement(binding, settled, 'outbox');
+                return (await store.readTask(target, args.targetTaskId)).pendingEvents;
+            }
+        }
+
         if (action === 'cancel-tree-setup') {
             const parent = await store.createTask(binding, 's', { ...spec, deferStart: true });
             const child = await store.createTask(binding, 's', { ...spec, parent: parent.id, deferStart: true });

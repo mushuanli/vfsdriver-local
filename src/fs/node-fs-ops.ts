@@ -9,6 +9,19 @@ import { randomUUID } from 'node:crypto';
 import type { IFsOps, StatResult, DirEntry } from './fs-ops';
 
 export class NodeFsOps implements IFsOps {
+    async readFileRange(path: string, offset: number, length: number): Promise<ArrayBuffer | null> {
+        const file = await fs.open(path, 'r').catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+        });
+        if (!file) return null;
+        try {
+            const buffer = Buffer.alloc(length);
+            const { bytesRead } = await file.read(buffer, 0, length, offset);
+            return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + bytesRead) as ArrayBuffer;
+        } finally { await file.close(); }
+    }
+
     async readFile(p: string): Promise<ArrayBuffer | null> {
         try {
             const buf = await fs.readFile(p);

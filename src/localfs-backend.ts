@@ -181,15 +181,22 @@ export class LocalFSBackend implements IStorageBackend {
         const p = dirPath === '/' ? '' : dirPath;
         const realDir = p === '' ? this.rootDir : this.resolve(p);
         const entries = await this.fsOps.readDir(realDir);
-
         const results: FSNode[] = [];
-        for (const entry of entries) {
-            const childPath = p === '' ? `/${entry.name}` : `${p}/${entry.name}`;
-            const realChild = joinPath(realDir, entry.name);
-            const stat = await this.fsOps.stat(realChild);
-            if (!stat) continue;
-            const ext = this.db ? await this.db.getMetaExt(childPath) : null;
-            results.push(toFSNode(childPath, stat, ext));
+        for (let start = 0; start < entries.length; start += 64) {
+            const batch = entries.slice(start, start + 64);
+            const paths = batch.map(entry => joinPath(realDir, entry.name));
+            const stats = this.fsOps.statMany ? await this.fsOps.statMany(paths)
+                : await Promise.all(paths.map(path => this.fsOps.stat(path)));
+            if (stats.length !== batch.length) throw new Error('Invalid batch stat response');
+            const nodes = await Promise.all(batch.map(async (entry, index) => {
+                const stat = stats[index];
+                // Listing safe siblings must not follow links or expose device nodes.
+                if (!stat || stat.isSymbolicLink || (!stat.isDirectory && stat.isFile === false)) return null;
+                const childPath = `${p}/${entry.name}`;
+                const ext = this.db ? await this.db.getMetaExt(childPath) : null;
+                return toFSNode(childPath, stat, ext);
+            }));
+            for (const node of nodes) if (node) results.push(node);
         }
         return results;
     }
@@ -291,11 +298,17 @@ export class LocalFSBackend implements IStorageBackend {
 
     async read(path: string, options?: { offset?: number; length?: number }): Promise<Uint8Array> {
         const realPath = this.resolve(path);
+        if (options?.length !== undefined && this.fsOps.readFileRange) {
+            const data = await this.fsOps.readFileRange(realPath, options.offset ?? 0, options.length);
+            if (!data) throw new Error(`ENOENT: ${path}`);
+            return new Uint8Array(data);
+        }
         const data = await this.fsOps.readFile(realPath);
         if (!data) throw new Error(`ENOENT: ${path}`);
         const bytes = new Uint8Array(data);
-        if (options?.offset !== undefined) {
-            return bytes.slice(options.offset, options.length ? options.offset + options.length : undefined);
+        if (options?.offset !== undefined || options?.length !== undefined) {
+            const offset = options.offset ?? 0;
+            return bytes.slice(offset, options.length !== undefined ? offset + options.length : undefined);
         }
         return bytes;
     }

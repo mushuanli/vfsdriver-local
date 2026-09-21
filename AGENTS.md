@@ -74,3 +74,7 @@ backend.resetSidecarStats();
 ```bash
 pnpm --filter @itookit/vfsdriver-localfs test   # vitest run
 ```
+
+目录列表按最多 64 个条目分批使用 `IFsOps.statMany`，没有批量端口时有界并发 stat；元数据读取同批有界并发。Tauri Session 的 ScopedFsOps 也必须实现 statMany（按 grant 分组，经 directory_stat_many 检查每条路径），不能仅在全局 TauriFsOps 上实现。性能回归见 `25-journal-probe.test.ts` 的宽目录列表测试。
+
+`IFsOps.readFileRange?` 提供有界宿主读取，`LocalFSBackend.read({offset,length})` 优先调用它；NodeFsOps 与 Tauri 的 ScopedFsOps 实现该端口，禁止先整块读取再截断。未实现端口的第三方驱动保留内存截断兼容路径。

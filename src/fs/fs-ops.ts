@@ -28,6 +28,8 @@ export interface DirEntry {
 export interface IFsOps {
     /** Read a file, returns null if it does not exist. */
     readFile(path: string): Promise<ArrayBuffer | null>;
+    /** Read at most length bytes without allocating the entire file. */
+    readFileRange?(path: string, offset: number, length: number): Promise<ArrayBuffer | null>;
 
     /**
      * Write data to a file.

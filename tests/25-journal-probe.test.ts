@@ -63,6 +63,13 @@ describe('rename journal probing', () => {
     });
     afterEach(async () => { await backend.close(); await rm(root, { recursive: true, force: true }); });
 
+    it('reads bounded ranges including zero length without returning the full file', async () => {
+        await backend.write('/file', new TextEncoder().encode('0123456789'));
+        expect(new TextDecoder().decode(await backend.read('/file', { offset: 3, length: 2 }))).toBe('34');
+        expect(await backend.read('/file', { offset: 3, length: 0 })).toHaveLength(0);
+        expect(new TextDecoder().decode(await backend.read('/file', { length: 3 }))).toBe('012');
+    });
+
     it('checks the journal once per outer transaction, including reads', async () => {
         expect(sidecar.journalProbes).toBe(1);
         for (let index = 0; index < 5; index += 1) await backend.records.setRecordField(`/f${index}`, 'state', index);
@@ -147,6 +154,19 @@ describe('rename journal probing', () => {
         } finally { await manager.dispose(); }
     });
 
+    it('lists a wide directory using bounded stat batches', async () => {
+        await mkdir(join(root, 'files', 'wide'));
+        await Promise.all(Array.from({ length: 130 }, (_, index) => writeFile(join(root, 'files', 'wide', `f${index}`), 'mdx')));
+        const port = (backend as unknown as { fsOps: { statMany: (paths: string[]) => Promise<unknown[]> } }).fsOps;
+        const original = port.statMany.bind(port);
+        const batches: number[] = [];
+        port.statMany = async paths => { batches.push(paths.length); return original(paths); };
+        const nodes = await backend.list('/wide');
+        expect(nodes).toHaveLength(130);
+        expect(nodes.every(node => node.type === 'file' && node.size === 3)).toBe(true);
+        expect(batches).toEqual([64, 64, 2]);
+    });
+
     it('rejects reading outside a mounted root through a filesystem symlink', async () => {
         const outside = join(root, 'outside');
         await mkdir(outside); await writeFile(join(outside, 'secret.txt'), 'must-not-read');
@@ -167,6 +187,8 @@ describe('rename journal probing', () => {
         const [safe, link] = await Promise.allSettled([backend.statType('/safe'), backend.statType('/link')]);
         expect(safe).toEqual({ status: 'fulfilled', value: { type: 'directory' } });
         expect(link).toMatchObject({ status: 'rejected', reason: expect.objectContaining({ code: 'EACCES' }) });
+        expect((await backend.list('/')).map(node => node.name)).toContain('safe');
+        expect((await backend.list('/')).map(node => node.name)).not.toContain('link');
     });
 
     it.each([0, 3])('rejects all waiters when the host returns %s rows for two paths', async count => {

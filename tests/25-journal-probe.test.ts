@@ -1,5 +1,5 @@
 /** Read optimizations must preserve cross-process rename recovery and capability checks. */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -63,11 +63,58 @@ describe('rename journal probing', () => {
     });
     afterEach(async () => { await backend.close(); await rm(root, { recursive: true, force: true }); });
 
+    it('closes a sidecar when startup journal recovery fails and permits a clean retry', async () => {
+        const db = new RecordingSidecar();
+        const close = vi.spyOn(db, 'close');
+        vi.spyOn(db, 'getRecordField').mockRejectedValueOnce(new Error('database is locked'));
+        const candidate = new LocalFSBackend({ rootDir: join(root, 'retry'), sidecarDir: join(root, 'retry-db'), createDb: async () => db });
+        await expect(candidate.init()).rejects.toThrow('database is locked');
+        expect(close).toHaveBeenCalledTimes(1);
+        await candidate.init();
+        await candidate.close();
+        expect(close).toHaveBeenCalledTimes(2);
+    });
+
     it('reads bounded ranges including zero length without returning the full file', async () => {
         await backend.write('/file', new TextEncoder().encode('0123456789'));
         expect(new TextDecoder().decode(await backend.read('/file', { offset: 3, length: 2 }))).toBe('34');
         expect(await backend.read('/file', { offset: 3, length: 0 })).toHaveLength(0);
         expect(new TextDecoder().decode(await backend.read('/file', { length: 3 }))).toBe('012');
+    });
+
+    it('lists lightweight entries and reads physical config without sidecar metadata or record probes', async () => {
+        for (let index = 0; index < 65; index++) await backend.write(`/light/f${index}`, new TextEncoder().encode('data'));
+        await symlink(join(root, 'files/light/f0'), join(root, 'files/light/link'));
+        const { createVFS, createFileSystemView, MemoryBackend } = await import('@itookit/vfs-core');
+        const { manager } = await createVFS({ rootBackend: new MemoryBackend(), additionalMounts: [{ path: '/ws', backend }] });
+        const inner = await manager.openFileSystem('/ws');
+        const view = createFileSystemView({ viewId: 'light', mounts: [{ mountId: 'inner', at: '/', fs: inner, access: 'ro' }] });
+        try {
+            backend.resetSidecarStats();
+            const entries = await view.driver.getChildren('/light', { fields: 'entry' });
+            expect(entries).toHaveLength(65);
+            expect(entries.every(entry => entry.size === 4 && !('metadata' in entry))).toBe(true);
+            expect(await view.driver.readContent('/light/f0', { representation: 'bytes', encoding: 'utf-8' })).toBe('data');
+            expect(backend.sidecarStats.getMetaExt).toBe(0);
+            expect(backend.sidecarStats.getRecordField).toBe(0);
+            expect(backend.sidecarStats.listRecordFields).toBe(0);
+        } finally { await view.dispose(); await manager.dispose(); }
+    });
+
+    it('reads requested SeqFile keys in one recovered record transaction', async () => {
+        const { createVFS } = await import('@itookit/vfs-core');
+        const { manager } = await createVFS({ rootBackend: backend });
+        try {
+            const fs = await manager.openFileSystem('/');
+            await fs.driver.createFile({ name: 'keys.seq', type: 'seqfile' });
+            await fs.meta.seq!.setEntries('/keys.seq', { a: '1', b: '2', unused: '3' });
+            backend.resetSidecarStats();
+            expect(await fs.meta.seq!.getEntries('/keys.seq', ['a', 'b', 'a', 'missing'])).toEqual({ a: '1', b: '2' });
+            // One node lookup plus one record snapshot, regardless of the key count.
+            expect(backend.sidecarStats.transaction).toBe(2);
+            expect(backend.sidecarStats.getRecordField).toBe(5);
+            expect(backend.sidecarStats.setRecordField).toBe(0);
+        } finally { await manager.dispose(); }
     });
 
     it('checks the journal once per outer transaction, including reads', async () => {

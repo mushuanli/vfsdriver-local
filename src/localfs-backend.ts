@@ -11,6 +11,7 @@ import type {
     FSNode,
     FSFileNode,
     FSDirectoryNode,
+    DirEntry,
     IRecordStore,
     IRecordTransaction,
     RecordValue,
@@ -113,7 +114,14 @@ export class LocalFSBackend implements IStorageBackend {
             await ensureDir(this.fsOps, this.sidecarDir);
             this.db = await this.openSidecar(dbPath);
         }
-        await this.withDb(async () => undefined);
+        try {
+            await this.withDb(async () => undefined);
+        } catch (error) {
+            try { await this.close(); } catch (cleanupError) {
+                throw new AggregateError([error, cleanupError], 'Filesystem initialization and cleanup failed', { cause: error });
+            }
+            throw error;
+        }
     }
 
     private withDb<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T> {
@@ -178,10 +186,20 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     async list(dirPath: string): Promise<FSNode[]> {
+        return this.listNodes(dirPath, async (path, stat) => toFSNode(path, stat, this.db ? await this.db.getMetaExt(path) : null));
+    }
+
+    async listEntries(dirPath: string): Promise<DirEntry[]> {
+        return this.listNodes(dirPath, async (path, stat) => ({ path, name: path.slice(path.lastIndexOf('/') + 1),
+            type: stat.isDirectory ? 'directory' : 'file', modifiedAt: stat.mtimeMs,
+            ...(stat.isDirectory ? {} : { size: stat.size }) }));
+    }
+
+    private async listNodes<T>(dirPath: string, project: (path: string, stat: StatResult) => Promise<T>): Promise<T[]> {
         const p = dirPath === '/' ? '' : dirPath;
         const realDir = p === '' ? this.rootDir : this.resolve(p);
         const entries = await this.fsOps.readDir(realDir);
-        const results: FSNode[] = [];
+        const results: T[] = [];
         for (let start = 0; start < entries.length; start += 64) {
             const batch = entries.slice(start, start + 64);
             const paths = batch.map(entry => joinPath(realDir, entry.name));
@@ -193,8 +211,7 @@ export class LocalFSBackend implements IStorageBackend {
                 // Listing safe siblings must not follow links or expose device nodes.
                 if (!stat || stat.isSymbolicLink || (!stat.isDirectory && stat.isFile === false)) return null;
                 const childPath = `${p}/${entry.name}`;
-                const ext = this.db ? await this.db.getMetaExt(childPath) : null;
-                return toFSNode(childPath, stat, ext);
+                return project(childPath, stat);
             }));
             for (const node of nodes) if (node) results.push(node);
         }

@@ -238,6 +238,19 @@ describe('rename journal probing', () => {
         expect((await backend.list('/')).map(node => node.name)).not.toContain('link');
     });
 
+    it('deduplicates paths within a stat batch and observes deletion in the next batch', async () => {
+        await backend.mkdir('/same');
+        const port = (backend as unknown as { fsOps: { statMany: (paths: string[]) => Promise<unknown[]> } }).fsOps;
+        const original = port.statMany.bind(port), batches: string[][] = [];
+        port.statMany = paths => { batches.push(paths); return original(paths); };
+        expect(await Promise.all([backend.statType('/same'), backend.statType('/same')]))
+            .toEqual([{ type: 'directory' }, { type: 'directory' }]);
+        expect(batches.map(paths => paths.length)).toEqual([1]);
+        await backend.delete('/same');
+        expect(await backend.statType('/same')).toBeNull();
+        expect(batches.map(paths => paths.length)).toEqual([1, 1]);
+    });
+
     it.each([0, 3])('rejects all waiters when the host returns %s rows for two paths', async count => {
         const port = (backend as unknown as { fsOps: { statMany: (paths: string[]) => Promise<unknown[]> } }).fsOps;
         port.statMany = async () => Array(count).fill(null);

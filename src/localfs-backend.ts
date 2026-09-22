@@ -66,6 +66,7 @@ export class LocalFSBackend implements IStorageBackend {
         paths: string[];
         resolve: Array<(value: { type: 'file' | 'directory' } | null) => void>;
         reject: Array<(error: unknown) => void>;
+        pending: Map<string, Promise<{ type: 'file' | 'directory' } | null>>;
     };
 
     constructor(options: LocalFSBackendOptions) {
@@ -162,11 +163,15 @@ export class LocalFSBackend implements IStorageBackend {
             return checkedNodeType(stat);
         };
         if (!this.fsOps.statMany) return direct();
-        return new Promise((resolve, reject) => {
-            const batch = (this.statTypeBatch ??= { paths: [], resolve: [], reject: [] });
+        const batch: NonNullable<typeof this.statTypeBatch> = (this.statTypeBatch ??= { paths: [], resolve: [], reject: [], pending: new Map() });
+        const pending = batch.pending.get(path);
+        if (pending) return pending;
+        const work = new Promise<{ type: 'file' | 'directory' } | null>((resolve, reject) => {
             batch.paths.push(path); batch.resolve.push(resolve); batch.reject.push(reject);
             if (batch.paths.length === 1) queueMicrotask(() => { void this.flushStatTypes(); });
         });
+        batch.pending.set(path, work);
+        return work;
     }
 
     /** Flush the coalesced type-only stats in one `fsOps.statMany` call. */

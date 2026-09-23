@@ -47,6 +47,14 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return Promise.resolve(row ?? null);
     }
 
+    getMetaExtMany(paths: string[]): Promise<MetaExtRow[]> {
+        const unique = [...new Set(paths)];
+        if (!unique.length) return Promise.resolve([]);
+        const rows = this.prepare(`SELECT * FROM meta_ext WHERE path IN (${unique.map(() => '?').join(', ')})`)
+            .all(...unique) as MetaExtRow[];
+        return Promise.resolve(rows);
+    }
+
     upsertMetaExt(row: MetaExtRow): Promise<void> {
         try {
             this.prepare(`
@@ -120,6 +128,18 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         const row = this.prepare('SELECT value FROM records WHERE path = ? AND field = ?')
             .get(path, field) as { value: string } | undefined;
         return Promise.resolve(row ? JSON.parse(row.value) : undefined);
+    }
+
+    getRecordFields(path: string, fields: string[]): Promise<Record<string, unknown>> {
+        const unique = [...new Set(fields)];
+        const result: Record<string, unknown> = {};
+        for (let start = 0; start < unique.length; start += 512) {
+            const batch = unique.slice(start, start + 512);
+            const rows = this.prepare(`SELECT field, value FROM records WHERE path = ? AND field IN (${batch.map(() => '?').join(', ')})`)
+                .all(path, ...batch) as Array<{ field: string; value: string }>;
+            for (const row of rows) result[row.field] = JSON.parse(row.value);
+        }
+        return Promise.resolve(result);
     }
 
     setRecordField(path: string, field: string, value: unknown): Promise<void> {

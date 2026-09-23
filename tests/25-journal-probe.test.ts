@@ -12,8 +12,10 @@ class RecordingSidecar implements ISidecarDb {
     journalProbes = 0;
     transactions = 0;
     metaExtCalls = 0;
+    metaExtBatches = 0;
     private records = new Map<string, unknown>();
     async getMetaExt(): Promise<MetaExtRow | null> { this.metaExtCalls += 1; return null; }
+    async getMetaExtMany(): Promise<MetaExtRow[]> { this.metaExtBatches += 1; return []; }
     async upsertMetaExt(): Promise<void> {}
     async deleteMetaExt(): Promise<void> {}
     async syncTags(): Promise<void> {}
@@ -24,6 +26,12 @@ class RecordingSidecar implements ISidecarDb {
     async getRecordField(path: string, field: string): Promise<unknown | undefined> {
         if (path === JOURNAL && field === 'intent') this.journalProbes += 1;
         return this.records.get(`${path}\0${field}`);
+    }
+    async getRecordFields(path: string, fields: string[]): Promise<Record<string, unknown>> {
+        return Object.fromEntries(fields.flatMap(field => {
+            const value = this.records.get(`${path}\0${field}`);
+            return value === undefined ? [] : [[field, value]];
+        }));
     }
     async setRecordField(path: string, field: string, value: unknown): Promise<void> { this.records.set(`${path}\0${field}`, value); }
     async deleteRecordField(path: string, field: string): Promise<void> { this.records.delete(`${path}\0${field}`); }
@@ -112,7 +120,8 @@ describe('rename journal probing', () => {
             expect(await fs.meta.seq!.getEntries('/keys.seq', ['a', 'b', 'a', 'missing'])).toEqual({ a: '1', b: '2' });
             // One node lookup plus one record snapshot, regardless of the key count.
             expect(backend.sidecarStats.transaction).toBe(2);
-            expect(backend.sidecarStats.getRecordField).toBe(5);
+            expect(backend.sidecarStats.getRecordFields).toBe(1);
+            expect(backend.sidecarStats.getRecordField).toBe(2);
             expect(backend.sidecarStats.setRecordField).toBe(0);
         } finally { await manager.dispose(); }
     });
@@ -208,10 +217,15 @@ describe('rename journal probing', () => {
         const original = port.statMany.bind(port);
         const batches: number[] = [];
         port.statMany = async paths => { batches.push(paths.length); return original(paths); };
+        const transactions = sidecar.transactions, probes = sidecar.journalProbes;
         const nodes = await backend.list('/wide');
         expect(nodes).toHaveLength(130);
         expect(nodes.every(node => node.type === 'file' && node.size === 3)).toBe(true);
         expect(batches).toEqual([64, 64, 2]);
+        expect(sidecar.metaExtBatches).toBe(3);
+        expect(sidecar.metaExtCalls).toBe(0);
+        expect(sidecar.transactions).toBe(transactions + 1);
+        expect(sidecar.journalProbes).toBe(probes + 1);
     });
 
     it('rejects reading outside a mounted root through a filesystem symlink', async () => {

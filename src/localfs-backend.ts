@@ -191,16 +191,26 @@ export class LocalFSBackend implements IStorageBackend {
     }
 
     async list(dirPath: string): Promise<FSNode[]> {
-        return this.listNodes(dirPath, async (path, stat) => toFSNode(path, stat, this.db ? await this.db.getMetaExt(path) : null));
+        return this.withDbRead(db => this.listNodes(dirPath, async items => {
+            const paths = items.map(item => item.path);
+            const rows = db.getMetaExtMany
+                ? await db.getMetaExtMany(paths)
+                : await Promise.all(paths.map(path => db.getMetaExt(path))).then(values => values.filter((row): row is MetaExtRow => Boolean(row)));
+            const metadata = new Map(rows.map(row => [row.path, row]));
+            return items.map(item => toFSNode(item.path, item.stat, metadata.get(item.path) ?? null));
+        }));
     }
 
     async listEntries(dirPath: string): Promise<DirEntry[]> {
-        return this.listNodes(dirPath, async (path, stat) => ({ path, name: path.slice(path.lastIndexOf('/') + 1),
+        return this.listNodes(dirPath, async items => items.map(({ path, stat }) => ({
+            path, name: path.slice(path.lastIndexOf('/') + 1),
             type: stat.isDirectory ? 'directory' : 'file', modifiedAt: stat.mtimeMs,
-            ...(stat.isDirectory ? {} : { size: stat.size }) }));
+            ...(stat.isDirectory ? {} : { size: stat.size }),
+        })));
     }
 
-    private async listNodes<T>(dirPath: string, project: (path: string, stat: StatResult) => Promise<T>): Promise<T[]> {
+    private async listNodes<T>(dirPath: string,
+        project: (items: Array<{ path: string; stat: StatResult }>) => Promise<T[]>): Promise<T[]> {
         const p = dirPath === '/' ? '' : dirPath;
         const realDir = p === '' ? this.rootDir : this.resolve(p);
         const entries = await this.fsOps.readDir(realDir);
@@ -211,14 +221,13 @@ export class LocalFSBackend implements IStorageBackend {
             const stats = this.fsOps.statMany ? await this.fsOps.statMany(paths)
                 : await Promise.all(paths.map(path => this.fsOps.stat(path)));
             if (stats.length !== batch.length) throw new Error('Invalid batch stat response');
-            const nodes = await Promise.all(batch.map(async (entry, index) => {
+            const items = batch.flatMap((entry, index) => {
                 const stat = stats[index];
                 // Listing safe siblings must not follow links or expose device nodes.
-                if (!stat || stat.isSymbolicLink || (!stat.isDirectory && stat.isFile === false)) return null;
-                const childPath = `${p}/${entry.name}`;
-                return project(childPath, stat);
-            }));
-            for (const node of nodes) if (node) results.push(node);
+                return !stat || stat.isSymbolicLink || (!stat.isDirectory && stat.isFile === false)
+                    ? [] : [{ path: `${p}/${entry.name}`, stat }];
+            });
+            results.push(...await project(items));
         }
         return results;
     }
@@ -539,6 +548,14 @@ class SidecarRecordStore implements IRecordStore {
     getRecordField(path: string, field: string): Promise<RecordValue | undefined> {
         if (!this.scoped) return this.withDbRead(db => db.getRecordField(path, field)) as Promise<RecordValue | undefined>;
         return this.db().getRecordField(path, field) as Promise<RecordValue | undefined>;
+    }
+    getRecordFields(path: string, fields: string[]): Promise<Record<string, RecordValue>> {
+        const read = async (db: ISidecarDb) => {
+            if (db.getRecordFields) return db.getRecordFields(path, fields) as Promise<Record<string, RecordValue>>;
+            const entries = await Promise.all([...new Set(fields)].map(async field => [field, await db.getRecordField(path, field)] as const));
+            return Object.fromEntries(entries.filter((entry): entry is [string, RecordValue] => entry[1] !== undefined));
+        };
+        return this.scoped ? read(this.db()) : this.withDbRead(read);
     }
     setRecordField(path: string, field: string, value: RecordValue): Promise<void> {
         if (!this.scoped) return this.withDb(db => db.setRecordField(path, field, value));

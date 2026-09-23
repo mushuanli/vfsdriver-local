@@ -10,10 +10,10 @@ import type { ISidecarDb } from './sidecar-interface';
 
 /** Logical `ISidecarDb` operations, in a fixed order for stable stats. */
 export const SIDECAR_OPERATIONS = [
-    'getMetaExt', 'upsertMetaExt', 'deleteMetaExt',
+    'getMetaExt', 'getMetaExtMany', 'upsertMetaExt', 'deleteMetaExt',
     'movePathData', 'assertPathDataVacant',
     'syncTags', 'getAllDistinctTags', 'queryByTag', 'listTagEntries',
-    'getRecordField', 'setRecordField', 'deleteRecordField', 'listRecordFields', 'clearRecordFields',
+    'getRecordField', 'getRecordFields', 'setRecordField', 'deleteRecordField', 'listRecordFields', 'clearRecordFields',
     'transaction', 'begin', 'commit', 'rollback', 'healthCheck', 'close',
 ] as const;
 

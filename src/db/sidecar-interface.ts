@@ -16,6 +16,7 @@ export interface MetaExtRow {
 export interface ISidecarDb {
     // ── meta_ext ──
     getMetaExt(path: string): Promise<MetaExtRow | null>;
+    getMetaExtMany?(paths: string[]): Promise<MetaExtRow[]>;
     upsertMetaExt(row: MetaExtRow): Promise<void>;
     deleteMetaExt(path: string): Promise<void>;
 
@@ -32,6 +33,7 @@ export interface ISidecarDb {
 
     // ── SeqFile records ──
     getRecordField(path: string, field: string): Promise<unknown | undefined>;
+    getRecordFields?(path: string, fields: string[]): Promise<Record<string, unknown>>;
     setRecordField(path: string, field: string, value: unknown): Promise<void>;
     deleteRecordField(path: string, field: string): Promise<void>;
     listRecordFields(path: string, prefix?: string): Promise<Array<{ field: string; value: unknown }>>;

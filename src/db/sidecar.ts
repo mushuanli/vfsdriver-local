@@ -1,3 +1,4 @@
+import { RECORD_PAGE_SQL, recordPageValues, decodeRecordPage, type RecordPageRow } from './record-page';
 /**
  * @file vfsdriver-localfs/src/db/sidecar.ts
  *
@@ -169,6 +170,11 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
             WHERE path = ? AND field LIKE ? ESCAPE '\\' ORDER BY field`)
             .all(path, `${escapeLike(prefix)}%`) as Array<{ field: string; value: string }>;
         return Promise.resolve(rows.map(row => ({ field: row.field, value: JSON.parse(row.value) })));
+    }
+
+    async listRecordFieldsPage(path: string, prefix: string, offset: number, limit: number) {
+        const rows = this.prepare(RECORD_PAGE_SQL).all(...recordPageValues(path, prefix, offset, limit)) as RecordPageRow[];
+        return decodeRecordPage(rows);
     }
 
     clearRecordFields(path: string): Promise<void> {

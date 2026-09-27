@@ -22,3 +22,6 @@ export {
 } from './utils/fs-utils';
 
 export { PATH_DATA_EXISTS, movePathStatements } from './db/path-data';
+
+export { RECORD_PAGE_SQL, recordPageValues, decodeRecordPage } from './db/record-page';
+export type { RecordPageRow, SidecarRecordPage } from './db/record-page';

@@ -39,6 +39,8 @@ export interface ISidecarDb {
     setRecordField(path: string, field: string, value: unknown): Promise<void>;
     deleteRecordField(path: string, field: string): Promise<void>;
     listRecordFields(path: string, prefix?: string): Promise<Array<{ field: string; value: unknown }>>;
+    /** SQL-bounded page with the exact prefix total, on the current connection. */
+    listRecordFieldsPage?(path: string, prefix: string, offset: number, limit: number): Promise<import('./record-page').SidecarRecordPage>;
     clearRecordFields(path: string): Promise<void>;
 
     /** Supply a connection-bound handle for every operation in the transaction. */

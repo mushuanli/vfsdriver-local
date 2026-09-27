@@ -13,7 +13,7 @@ export const SIDECAR_OPERATIONS = [
     'getMetaExt', 'getMetaExtMany', 'upsertMetaExt', 'deleteMetaExt',
     'movePathData', 'assertPathDataVacant',
     'syncTags', 'getAllDistinctTags', 'queryByTag', 'listTagEntries',
-    'getRecordField', 'getRecordFields', 'getRecordFieldsMany', 'setRecordField', 'deleteRecordField', 'listRecordFields', 'clearRecordFields',
+    'getRecordField', 'getRecordFields', 'getRecordFieldsMany', 'setRecordField', 'deleteRecordField', 'listRecordFields', 'listRecordFieldsPage', 'clearRecordFields',
     'transaction', 'begin', 'commit', 'rollback', 'healthCheck', 'close',
 ] as const;
 

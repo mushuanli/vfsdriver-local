@@ -611,14 +611,18 @@ class SidecarRecordStore implements IRecordStore {
         callback: (field: string, value: RecordValue) => boolean | Promise<boolean>,
         options?: RecordWalkOptions,
     ): Promise<{ total: number; processed: number }> {
-        const rows = await this.rows(path, options?.prefix);
-        let processed = 0;
-        const limit = options?.limit ?? Number.POSITIVE_INFINITY;
-        for (const row of rows.slice(options?.offset ?? 0)) {
-            if (processed >= limit || !(await callback(row.field, row.value as RecordValue))) break;
-            processed++;
+        const offset = options?.offset ?? 0, limit = options?.limit ?? Number.POSITIVE_INFINITY;
+        const bounded = options?.limit !== undefined || options?.offset !== undefined;
+        if (bounded && this.db().listRecordFieldsPage && Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(limit) && limit >= 0) {
+            const read = async (db: ISidecarDb) => {
+                if (!db.listRecordFieldsPage) return undefined;
+                return db.listRecordFieldsPage(path, options?.prefix ?? '', offset, limit);
+            };
+            const page = this.scoped ? await read(this.db()) : await this.withDbRead(read);
+            if (page) return { total: page.total, processed: await visitRecordRows(page.rows, callback) };
         }
-        return { total: rows.length, processed };
+        const rows = await this.rows(path, options?.prefix);
+        return { total: rows.length, processed: await visitRecordRows(rows.slice(offset), callback, limit) };
     }
     async walkRecordFieldNames(
         path: string,
@@ -676,6 +680,16 @@ class SidecarRecordStore implements IRecordStore {
             throw error;
         }
     }
+}
+
+async function visitRecordRows(rows: Array<{ field: string; value: unknown }>,
+    callback: (field: string, value: RecordValue) => boolean | Promise<boolean>, limit = Infinity): Promise<number> {
+    let processed = 0;
+    for (const row of rows) {
+        if (processed >= limit || !(await callback(row.field, row.value as RecordValue))) break;
+        processed++;
+    }
+    return processed;
 }
 
 function recordMatches(value: RecordValue, query: RecordQuery): boolean {

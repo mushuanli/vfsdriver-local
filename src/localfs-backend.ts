@@ -14,6 +14,7 @@ import type {
     DirEntry,
     IRecordStore,
     IRecordTransaction,
+    RecordFieldRequest,
     RecordValue,
     RecordQuery,
     RecordQueryOptions,
@@ -537,6 +538,8 @@ export class LocalFSBackend implements IStorageBackend {
 }
 
 const RENAME_JOURNAL = '/__vfs_namespace_journal__';
+/** 每条 SQL 两个绑定参数，控制在 SQLite 变量上限内。 */
+const SIDECAR_RECORD_BATCH = 200;
 
 class SidecarRecordStore implements IRecordStore {
     private tail: Promise<void> = Promise.resolve();
@@ -554,6 +557,20 @@ class SidecarRecordStore implements IRecordStore {
             if (db.getRecordFields) return db.getRecordFields(path, fields) as Promise<Record<string, RecordValue>>;
             const entries = await Promise.all([...new Set(fields)].map(async field => [field, await db.getRecordField(path, field)] as const));
             return Object.fromEntries(entries.filter((entry): entry is [string, RecordValue] => entry[1] !== undefined));
+        };
+        return this.scoped ? read(this.db()) : this.withDbRead(read);
+    }
+    getRecordFieldsMany(requests: ReadonlyArray<RecordFieldRequest>): Promise<Array<RecordValue | undefined>> {
+        const read = async (db: ISidecarDb) => {
+            const values: Array<RecordValue | undefined> = new Array(requests.length).fill(undefined);
+            for (let offset = 0; offset < requests.length; offset += SIDECAR_RECORD_BATCH) {
+                const batch = requests.slice(offset, offset + SIDECAR_RECORD_BATCH);
+                const found = db.getRecordFieldsMany
+                    ? await db.getRecordFieldsMany(batch)
+                    : await Promise.all(batch.map(request => db.getRecordField(request.path, request.field)));
+                found.forEach((value, index) => { values[offset + index] = value as RecordValue | undefined; });
+            }
+            return values;
         };
         return this.scoped ? read(this.db()) : this.withDbRead(read);
     }

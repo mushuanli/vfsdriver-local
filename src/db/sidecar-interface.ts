@@ -34,6 +34,8 @@ export interface ISidecarDb {
     // ── SeqFile records ──
     getRecordField(path: string, field: string): Promise<unknown | undefined>;
     getRecordFields?(path: string, fields: string[]): Promise<Record<string, unknown>>;
+    /** 一次读取多条 (path, field)；结果顺序与入参一致，缺失为 undefined。 */
+    getRecordFieldsMany?(requests: ReadonlyArray<{ path: string; field: string }>): Promise<Array<unknown | undefined>>;
     setRecordField(path: string, field: string, value: unknown): Promise<void>;
     deleteRecordField(path: string, field: string): Promise<void>;
     listRecordFields(path: string, prefix?: string): Promise<Array<{ field: string; value: unknown }>>;

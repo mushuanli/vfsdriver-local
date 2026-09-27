@@ -142,6 +142,16 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return Promise.resolve(result);
     }
 
+    /** Requests are pre-batched by the caller (SidecarRecordStore) to stay under the parameter limit. */
+    getRecordFieldsMany(requests: ReadonlyArray<{ path: string; field: string }>): Promise<Array<unknown | undefined>> {
+        if (!requests.length) return Promise.resolve([]);
+        const rows = this.prepare(
+            `SELECT path, field, value FROM records WHERE (path, field) IN (${requests.map(() => '(?, ?)').join(', ')})`)
+            .all(...requests.flatMap(request => [request.path, request.field])) as Array<{ path: string; field: string; value: string }>;
+        const found = new Map(rows.map(row => [`${row.path}\u0000${row.field}`, JSON.parse(row.value) as unknown]));
+        return Promise.resolve(requests.map(request => found.get(`${request.path}\u0000${request.field}`)));
+    }
+
     setRecordField(path: string, field: string, value: unknown): Promise<void> {
         this.prepare(`INSERT INTO records(path, field, value) VALUES (?, ?, ?)
             ON CONFLICT(path, field) DO UPDATE SET value = excluded.value`)

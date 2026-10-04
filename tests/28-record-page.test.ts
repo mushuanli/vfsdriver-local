@@ -4,18 +4,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalFSBackend } from '../src/localfs-backend';
 import { BetterSqliteSidecarDb } from '../src/db/sidecar';
-import { NodeSqliteSidecarDb } from '../../../apps/cli/src/sqlite-sidecar';
 import type { ISidecarDb } from '../src/db/sidecar-interface';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-it.each(['better', 'node'] as const)('bounds SQLite page payloads and retains totals and transaction visibility (%s)', async kind => {
+it.each(['better'] as const)('bounds SQLite page payloads and retains totals and transaction visibility (%s)', async () => {
     const root = await mkdtemp(join(tmpdir(), 'record-page-'));
     cleanup.push(() => rm(root, { recursive: true, force: true }));
     let db!: ISidecarDb;
     const backend = new LocalFSBackend({ rootDir: root, sidecarDir: join(root, '.meta'),
-        createDb: async path => db = kind === 'better' ? new BetterSqliteSidecarDb(path) : await NodeSqliteSidecarDb.open(path) });
+        createDb: async path => db = new BetterSqliteSidecarDb(path) });
     await backend.init(); cleanup.push(() => backend.close());
     await backend.records.transaction!(async tx => {
         for (let i = 0; i < 120; i++) await tx.setRecordField('/r', `a_%/${String(i).padStart(3, '0')}`, { i });

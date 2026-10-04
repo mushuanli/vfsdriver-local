@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/utils/fs-utils.ts
+ * @file vfsdriver-local/src/utils/fs-utils.ts
  * Filesystem helpers that operate through IFsOps (no direct node:fs import).
  */
 

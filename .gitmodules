@@ -1,0 +1,3 @@
+[submodule "vendor/vfs-core"]
+	path = vendor/vfs-core
+	url = git@github.com:mushuanli/vfs-core.git

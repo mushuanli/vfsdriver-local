@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/fs/node-fs-ops.ts
+ * @file vfsdriver-local/src/fs/node-fs-ops.ts
  * IFsOps implementation backed by node:fs (Node.js / Electron).
  */
 

@@ -1,4 +1,4 @@
-# @itookit/vfsdriver-localfs
+# @itookit/vfsdriver-local
 
 Node.js 本地文件系统存储后端 — 实现 path-based `IStorageBackend`。
 
@@ -36,7 +36,7 @@ src/
 
 ```ts
 // 创建/打开
-import { openLocalFSBackend } from '@itookit/vfsdriver-localfs';
+import { openLocalFSBackend } from '@itookit/vfsdriver-local';
 const backend = await openLocalFSBackend({ rootDir: '/path/to/vfs', sidecarDir: '/path/to/vfs/.meta' });
 
 // 健康检查
@@ -54,7 +54,7 @@ backend.resetSidecarStats();
 | 后端 | 平台 | 元数据存储 | 内容存储 |
 |---|---|---|---|
 | `vfsdriver-indexeddb` | 浏览器 | IndexedDB | IndexedDB |
-| `vfsdriver-localfs` | Node | SQLite sidecar | 原生文件系统 |
+| `vfsdriver-local` | Node | SQLite sidecar | 原生文件系统 |
 | `vfs-core MemoryBackend` | Node/Browser | 内存 | 内存 |
 
 ## 编码约定
@@ -63,19 +63,23 @@ backend.resetSidecarStats();
 - `write` 使用临时文件 + rename 保证原子性;临时名必须**每次写唯一**（Node 使用 UUID 并以 wx 独占创建；Rust 使用序号候选并以 create_new 独占创建）——否则同一路径的并发写会共用临时文件、第二个 rename 报 `ENOENT`(桌面 Rust `fs_write_file` 同样要唯一,且不能改真实扩展名)。回归:`25-journal-probe.test.ts`「survives concurrent writes to the same path」。
 - 元数据(metadata, tags, icon)写入 SQLite sidecar,不与文件内容耦合。
 - `init()` 仅在完整性检查明确报告损坏，或原生 SQLite 返回 SQLITE_CORRUPT/SQLITE_NOTADB 时重建；探针不可用、未知/空结果和普通关闭错误不能授权删除数据库，须保留原文件并抛出原初始化错误。
-- **rename journal 每个外层事务核对**：另一进程可在当前连接打开后提交 intent 并崩溃；实例内「曾经干净」不能证明 journal 仍为空。恢复与记录/元数据读写必须在同一事务内执行。`20-kernel-ipc.test.ts` 覆盖先打开读者、写者在文件 rename 后 SIGKILL、原读者恢复 sidecar 的 root/module 两条路径。
+- **rename journal 每个外层事务核对**：另一进程可在当前连接打开后提交 intent 并崩溃；实例内「曾经干净」不能证明 journal 仍为空。恢复与记录/元数据读写必须在同一事务内执行。`apps/cli/tests/20-kernel-ipc.test.ts` 覆盖先打开读者、写者在文件 rename 后 SIGKILL、原读者恢复 sidecar 的 root/module 两条路径。
 - **只读恢复边界**：`withDbRead` 复用事务路径，在执行读取前核对并恢复 rename journal。事务内已绑定的 scoped 记录句柄直接使用同一连接。后续减少 IPC 应通过原子批量操作，不能省略跨进程恢复检查。
 - **sidecar 批量读取**：完整目录列表按 64 项调用 `getMetaExtMany`；SeqFile 已知字段集合调用 `getRecordFields`；跨多个 SeqFile 的同类扫描调用 `getRecordFieldsMany`（`SidecarRecordStore` 按 200 条/批，一条 `(path, field) IN (…)`，批内共用一次 `withDbRead`/外层事务与一次 rename journal 核对）。三者均留在同一个 `withDbRead`/外层事务中，因此每批只核对一次 rename journal；路径映射层不得丢失批量能力。禁止改成进程级读缓存。`TauriSqlSidecarDb` 与 Node/CLI 实现同一 SQL 形态（`sidecar_select` 接受变长参数），桌面本轮未做运行时验收。**遍历成本回归**：`tests/29-record-walk-cost.test.ts` 断言 500 字段节点 = 1 条语句 + 1 个 recovery 事务、40 个节点 = 40 条语句/事务（不是每行或每字段一次操作）；这是浏览器 IndexedDB 旧实现（每行一次请求）在桌面侧的对应守卫。
-- **`statType` 供能力检查用**:VFS 的 `noLinks` 会对每个路径前缀做类型检查,`LocalFSBackend.statType` 复用同一个 `fsOps.stat` 但**不读 sidecar 元数据**——否则每个前缀都是一次 `getMetaExt` IPC。实测单次发送的 VFS stat 由 653 降到 114。语义与 `stat` 的类型同源,不要在其中加元数据。`25-journal-probe.test.ts` 守「深路径只对目标取一次元数据」。详见 [验收记录 §14](../../doc/minimal-system-acceptance.md)。
-- **`statType` 微批处理**:`noLinks` 并发发起各前缀检查,`LocalFSBackend` 把同一事件循环 tick 的 `statType` 合并为一次 `IFsOps.statMany`(桌面 = 一次 `fs_stat_many` IPC)。**不要改成逐个 await 或逐个 `fsOps.stat`**,那会把一次发送的前缀走查从批量打回 ~900 次 IPC。回归:`25-journal-probe.test.ts`「coalesces a path-prefix walk into one batched stat call」。详见 [验收记录 §16](../../doc/minimal-system-acceptance.md)。
+- **`statType` 供能力检查用**:VFS 的 `noLinks` 会对每个路径前缀做类型检查,`LocalFSBackend.statType` 复用同一个 `fsOps.stat` 但**不读 sidecar 元数据**——否则每个前缀都是一次 `getMetaExt` IPC。实测单次发送的 VFS stat 由 653 降到 114。语义与 `stat` 的类型同源,不要在其中加元数据。`25-journal-probe.test.ts` 守「深路径只对目标取一次元数据」。详见 [验收记录 §14](https://github.com/mushuanli/itookit/blob/v5.3/doc/minimal-system-acceptance.md)。
+- **`statType` 微批处理**:`noLinks` 并发发起各前缀检查,`LocalFSBackend` 把同一事件循环 tick 的 `statType` 合并为一次 `IFsOps.statMany`(桌面 = 一次 `fs_stat_many` IPC)。**不要改成逐个 await 或逐个 `fsOps.stat`**,那会把一次发送的前缀走查从批量打回 ~900 次 IPC。回归:`25-journal-probe.test.ts`「coalesces a path-prefix walk into one batched stat call」。详见 [验收记录 §16](https://github.com/mushuanli/itookit/blob/v5.3/doc/minimal-system-acceptance.md)。
 - 此包仅用于 Node/Electron 环境,依赖 `better-sqlite3` (原生模块)。
 
 ## 测试
 
 ```bash
-pnpm --filter @itookit/vfsdriver-localfs test   # vitest run
+pnpm --filter @itookit/vfsdriver-local test   # vitest run
 ```
 
 目录列表按最多 64 个条目分批使用 `IFsOps.statMany`，没有批量端口时有界并发 stat；完整节点的 sidecar 元数据同批调用 `getMetaExtMany`，轻量 `fields: 'entry'` 不读元数据。Tauri Session 的 ScopedFsOps 也必须实现 statMany（按 grant 分组，经 directory_stat_many 检查每条路径），不能仅在全局 TauriFsOps 上实现。性能回归见 `25-journal-probe.test.ts` 的宽目录列表测试。
 
 `IFsOps.readFileRange?` 提供有界宿主读取，`LocalFSBackend.read({offset,length})` 优先调用它；NodeFsOps 与 Tauri 的 ScopedFsOps 实现该端口，禁止先整块读取再截断。未实现端口的第三方驱动保留内存截断兼容路径。
+
+## 独立仓库边界
+
+开发 core 由 `vendor/vfs-core` 固定；独立 `pnpm test` 仅包含驱动测试。内核 IPC 与 Node SQLite 适配集成测试归属 itookit 的 `apps/cli/tests`，不反向增加驱动依赖。

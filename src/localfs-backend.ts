@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/localfs-backend.ts
+ * @file vfsdriver-local/src/localfs-backend.ts
  * v4.1: Path-based IStorageBackend. No ino allocation, no path_ino table.
  *
  * Stores files directly in rootDir. Non-derivable metadata in sidecar SQLite.

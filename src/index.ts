@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/index.ts
+ * @file vfsdriver-local/src/index.ts
  * Public API — browser-safe exports only. v4.1.
  */
 

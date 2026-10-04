@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/db/sidecar-sync.ts
+ * @file vfsdriver-local/src/db/sidecar-sync.ts
  *
  * ISidecarDbSync — synchronous transaction control for better-sqlite3.
  *

@@ -1,6 +1,6 @@
 import { RECORD_PAGE_SQL, recordPageValues, decodeRecordPage, type RecordPageRow } from './record-page';
 /**
- * @file vfsdriver-localfs/src/db/sidecar.ts
+ * @file vfsdriver-local/src/db/sidecar.ts
  *
  * BetterSqliteSidecarDb — path-based sidecar SQLite (v4.1).
  * Only stores non-derivable metadata. No ino allocation or path_ino CRUD.

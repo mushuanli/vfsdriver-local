@@ -6,8 +6,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { promises as fsp } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openLocalFSBackend, LocalFSBackend } from '@itookit/vfsdriver-localfs';
-import type { LocalFSBackendOptions } from '@itookit/vfsdriver-localfs';
+import { openLocalFSBackend, LocalFSBackend } from '@itookit/vfsdriver-local';
+import type { LocalFSBackendOptions } from '@itookit/vfsdriver-local';
 
 // ── Temp directory helpers ─────────────────────────────────────────────────
 

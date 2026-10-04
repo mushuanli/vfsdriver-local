@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/db/schema.ts
+ * @file vfsdriver-local/src/db/schema.ts
  *
  * v4.1 Sidecar SQLite schema — path-based, no ino/counters/path_ino tables.
  *

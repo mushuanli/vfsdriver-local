@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/db/sidecar-interface.ts
+ * @file vfsdriver-local/src/db/sidecar-interface.ts
  * v4.1: Simplified ISidecarDb for path-based backend. No ino allocation or path_ino CRUD.
  */
 

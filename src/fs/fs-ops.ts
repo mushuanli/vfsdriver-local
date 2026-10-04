@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/fs/fs-ops.ts
+ * @file vfsdriver-local/src/fs/fs-ops.ts
  *
  * IFsOps — abstraction over filesystem operations.
  *

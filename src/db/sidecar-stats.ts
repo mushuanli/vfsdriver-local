@@ -1,5 +1,5 @@
 /**
- * @file vfsdriver-localfs/src/db/sidecar-stats.ts
+ * @file vfsdriver-local/src/db/sidecar-stats.ts
  *
  * Sidecar (SQLite) logical operation counting, including transaction callbacks.
  * One method may issue several host IPC requests; these counts are not transport totals.

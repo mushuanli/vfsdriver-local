@@ -32,6 +32,14 @@ export interface LocalFSBackendOptions {
     sidecarDir: string;
     createDb?: (dbPath: string) => Promise<ISidecarDb>;
     createFs?: () => IFsOps | Promise<IFsOps>;
+    durability?: 'full' | 'normal';
+}
+export interface LocalStorageAccess {
+    readonly identity: string;
+    readonly rootDir: string;
+    readonly sidecarDir: string;
+    readonly durability: 'full' | 'normal' | 'unknown';
+    transaction<T>(operation: (db: ISidecarDb) => Promise<T>): Promise<T>;
 }
 
 export interface VerifyResult {
@@ -73,12 +81,18 @@ export class LocalFSBackend implements IStorageBackend {
     constructor(options: LocalFSBackendOptions) {
         this.rootDir = options.rootDir;
         this.sidecarDir = options.sidecarDir;
-        this._createDb = options.createDb ?? defaultCreateDb;
+        this._createDb = options.createDb ?? (path => defaultCreateDb(path, options.durability));
         this._createFs = options.createFs ?? defaultCreateFs;
         this.records = new SidecarRecordStore(() => this.requireDb(), db => this.recoverRename(db), false);
     }
 
     get dbFilePath(): string { return joinPath(this.sidecarDir, 'index.db'); }
+    /** Generic host storage access; callers retain the existing recovery/serialization boundary. */
+    storageAccess(): LocalStorageAccess {
+        const db = this.requireDb();
+        return { identity: `localfs:${this.rootDir}:${this.dbFilePath}`, rootDir: this.rootDir,
+            sidecarDir: this.sidecarDir, durability: db.durability ?? 'unknown', transaction: action => this.withDb(action) };
+    }
 
     /** Per-operation sidecar call counts, cumulative since open or the last reset. */
     get sidecarStats(): Readonly<Record<SidecarOperation, number>> {
@@ -716,9 +730,9 @@ export async function openLocalFSBackend(options: LocalFSBackendOptions): Promis
     return backend;
 }
 
-async function defaultCreateDb(dbPath: string): Promise<ISidecarDb> {
+async function defaultCreateDb(dbPath: string, durability?: 'full' | 'normal'): Promise<ISidecarDb> {
     const { BetterSqliteSidecarDb } = await import('./db/sidecar');
-    return new BetterSqliteSidecarDb(dbPath);
+    return new BetterSqliteSidecarDb(dbPath, durability);
 }
 
 /** Unavailable probes and unknown results never authorize deleting durable data. */

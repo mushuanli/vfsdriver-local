@@ -12,6 +12,7 @@ import { DDL, SCHEMA_VERSION } from './schema';
 import { PATH_DATA_EXISTS, movePathStatements } from './path-data';
 
 export class BetterSqliteSidecarDb implements ISidecarDb {
+    readonly durability: 'full' | 'normal';
     private readonly db: Database.Database;
     // SQL here is a fixed set of parameterized templates. Retain prepared statements
     // for the connection lifetime instead of churning native objects on every record read.
@@ -26,13 +27,14 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return statement;
     }
 
-    constructor(dbPath: string) {
+    constructor(dbPath: string, durability: 'full' | 'normal' = 'normal') {
+        this.durability = durability;
         this.db = new Database(dbPath);
         this.db.pragma('journal_mode = WAL');
-        this.db.pragma('synchronous = NORMAL');
+        this.db.pragma(durability === 'full' ? 'synchronous = FULL' : 'synchronous = NORMAL');
         this.db.pragma('foreign_keys = ON');
         this.db.pragma('cache_size = -8000');
-        this.db.pragma('busy_timeout = 5000');
+        this.db.pragma(durability === 'full' ? 'busy_timeout = 0' : 'busy_timeout = 5000');
         const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>;
         if (tables.length) {
             const versions = tables.some(table => table.name === '_schema_version') ? this.db.prepare('SELECT version FROM _schema_version').all() as Array<{ version: number }> : [];
@@ -182,7 +184,17 @@ export class BetterSqliteSidecarDb implements ISidecarDb {
         return Promise.resolve();
     }
 
-    begin(): Promise<void> { this.db.exec('BEGIN IMMEDIATE'); return Promise.resolve(); }
+    async begin(): Promise<void> {
+        const started = Date.now();
+        for (;;) {
+            try { this.db.exec('BEGIN IMMEDIATE'); return; }
+            catch (error) {
+                if (this.durability !== 'full' || (error as { code?: string }).code !== 'SQLITE_BUSY' || Date.now() - started >= 5000) throw error;
+                // A synchronous busy wait would block another connection's async commit.
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+        }
+    }
     commit(): Promise<void> { this.db.exec('COMMIT'); return Promise.resolve(); }
     rollback(): Promise<void> { this.db.exec('ROLLBACK'); return Promise.resolve(); }
 

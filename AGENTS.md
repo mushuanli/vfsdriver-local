@@ -83,3 +83,7 @@ pnpm --filter @itookit/vfsdriver-local test   # vitest run
 ## 独立仓库边界
 
 开发 core 由 `vendor/vfs-core` 固定；独立 `pnpm test` 仅包含驱动测试。内核 IPC 与 Node SQLite 适配集成测试归属 itookit 的 `apps/cli/tests`，不反向增加驱动依赖。
+
+## 通用宿主事务端口
+
+`storageAccess()` 提供 rootDir、sidecarDir、身份、实际 durability 和连接绑定 transaction，复用现有 rename 恢复与串行边界。它不包含同步策略，不反向依赖 vfs-sync。Node 默认仍是 WAL/NORMAL；显式 `durability: 'full'` 使用 WAL/FULL，BEGIN IMMEDIATE 的 SQLITE_BUSY 通过有界异步重试，避免另一个连接同步等待时阻塞当前连接的文件 I/O 和提交。注入式 sidecar 可报告 durability，未报告时为 unknown。

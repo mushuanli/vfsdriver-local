@@ -14,6 +14,8 @@ export interface MetaExtRow {
 }
 
 export interface ISidecarDb {
+    /** Report the configured commit durability to hosts requiring recovery journals. */
+    readonly durability?: 'full' | 'normal';
     // ── meta_ext ──
     getMetaExt(path: string): Promise<MetaExtRow | null>;
     getMetaExtMany?(paths: string[]): Promise<MetaExtRow[]>;
